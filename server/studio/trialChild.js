@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import { fork } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { childEnvironment } from '../auth/child-env.js';
 import { sandboxProcessOptions } from '../match/host/childHost.js';
 import path from 'node:path';
 import { createPluginRegistry, readPluginFolder } from '../plugins/registry.js';
@@ -87,7 +88,7 @@ process.once('message', async ({ dirs, request, allowedScripts, temporary, heapM
     const baseScene = await trialScenario(request, base.data, original, originalOpponent);
     const modScene = await trialScenario(request, set.data, op, opponent);
     const options = scriptExecution(set.scripts || []) === 'sandbox' ? sandboxProcessOptions(heapMb)
-      : { execArgv: [`--max-old-space-size=${heapMb}`] };
+      : { env: childEnvironment(), execArgv: [`--max-old-space-size=${heapMb}`] };
     const runner = fork(fileURLToPath(new URL('./trialRunner.js', import.meta.url)), [], {
       ...options, serialization: 'json', stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
     });

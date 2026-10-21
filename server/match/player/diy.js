@@ -207,9 +207,9 @@ export class PlayerDiy {
     return { stock, banned: Object.freeze(banned) };
   }
 
-  /** The copy accounting of base chess `baseId` for this player: its own stock for a slotted DIY slot, else the shared pool. */
+  /** 按基础干员编号返回扣还库存：自选槽保持独立，其余使用玩家当前规则对应的普通库存。 */
   poolOf(baseId) {
-    return this.diyStock && this.diyStock.has(baseId) ? this.diyStock : this.m.pool;
+    return this.diyStock && this.diyStock.has(baseId) ? this.diyStock : this.chessPool;
   }
 
   /**

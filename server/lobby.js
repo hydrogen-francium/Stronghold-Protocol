@@ -26,12 +26,12 @@
 //     Disconnect in a match: the seat is kept and match.onDisconnect(playerId) is called.
 //   * Reconnect: `hello` with a known token (reconnect window, 10 min, see net.js) rebinds the session;
 //     the lobby then broadcasts room.state and, in a match, calls match.onReconnect(playerId).
-//     Solo runs (下半: "休整期及机变阶段没有时间限制…24小时内随时返回", research 01 §1 / 06 §17): a session that drops
+//     Solo runs without authentication (下半: "休整期及机变阶段没有时间限制…24小时内随时返回", research 01 §1 / 06 §17): a session that drops
 //     while its solo room's match runs stays resumable for the official `config.constants.singleReconnectTime`
 //     (86400 s; option `soloReconnectWindowMs` overrides it) instead of the 10-minute window — the untimed solo match
 //     simply waits (net.js session.resumeWindowMs, set at every disconnect). Only after that does expiry turn into
 //     match.onLeave ('abandoned'). The extension outlives the match, so a run that ended meanwhile (e.g. a server-run
-//     Final Assault) still shows its result on the player's return.
+//     Final Assault) still shows its result on the player's return. Authenticated servers instead use 10 min for all modes.
 //     A repeated hello on a live connection is a full resync: room.state goes to the requester only
 //     (broadcast only when the seat visibly changed, e.g. a rename in LOBBY); the heavy part (match.onReconnect,
 //     or the result replay below) runs at most once per `resyncMinGapMs` per session — extra requests inside
@@ -46,6 +46,10 @@
 //     created from one network may exist at once and at most `maxMatchesPerAddr` matches started from one
 //     network may run at once (room.create / room.start → ERR.RATE). Without them a socket loop could fill
 //     `maxRooms` or keep hundreds of unattended matches simulating for the whole reconnect window.
+//   * Authenticated starts reserve the actual human accounts and AI roster in the server's single Admission ledger,
+//     after ready/content/consent/resource gates and before constructing or booting a match. Lease/token/account mapping
+//     stay on that match's context only. Disconnect/elimination keep the lease; a real onLeave acknowledgement releases
+//     one account, and end/startup failure/dispose/shutdown release the whole lease. Room capacity remains 1–4.
 //   * Permanent departure during a match (room.leave, g.leave, reconnect window expired): the seat is
 //     marked departed (shown as connected=false), match.onLeave(playerId) is called, and the seat is freed
 //     when the match ends. 'g.leave' is handled here and never reaches match.handle().
@@ -162,7 +166,7 @@
 //     a player seat (the seat is kept and given back on resume).
 
 import { randomBytes, randomInt } from 'node:crypto';
-import { DIFFICULTIES, ERR, MAX_SEATS, MAX_SPECTATORS, ROOM_CODE_LEN, modeIdFor } from '../shared/constants.js';
+import { DIFFICULTIES, ERR, DEFAULT_SEATS, MAX_SEATS, ROOM_CAPACITIES, MAX_SPECTATORS, ROOM_CODE_LEN, modeIdFor } from '../shared/constants.js';
 import { checkLoadout, checkLoadoutOps, cultivationCharIds, checkNotOwned, checkDiyPicks, charPotentialChanges, checkSkinSelection, operatorCharIds } from '../shared/protocol.js';
 import { encode, isDroppable, isErrCode, sendRaw, sendSession } from './net.js';
 import { getData as defaultGetData, lookup } from './data.js';
@@ -174,6 +178,10 @@ import { isContentHash } from '../shared/plugins/identity.js';
 import { ruleOption } from '../shared/plugins/rules.js';
 import { msg, wireMessage } from '../shared/i18n.js';
 import { parseTestModeEnv, testModeGate, unrecognizedTestMode } from './testMode.js';
+import { AdmissionError } from './auth/admission.js';
+
+// Admission IDs are process-local bookkeeping only; never draw from a match's seed/RNG.
+let admissionMatchSeq = 0;
 
 /** Room code alphabet: uppercase letters without I and O (and no digits, so no 0/1). */
 export const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
@@ -183,7 +191,7 @@ export const LOBBY_DEFAULTS = Object.freeze({
   lobbyGraceMs: 60_000,   // disconnected humans keep their lobby seat this long
   maxRooms: 1000,
   maxRoomsPerAddr: 16,    // rooms created from one client network that may exist at once (0 = unlimited)
-  maxMatchesPerAddr: 8,   // matches started from one client network that may run at once (0 = unlimited)
+  maxMatchesPerAddr: 16,  // allow all 16 admitted humans to start separate matches behind one network (0 = unlimited)
   resyncMinGapMs: 1000,   // heavy resyncs (match state / result replay) per session at most this often on repeated hellos
   soloReconnectWindowMs: null, // a dropped solo run stays resumable this long (null = data singleReconnectTime, 24 h)
 });
@@ -204,7 +212,7 @@ const noopLog = { info() {}, warn() {}, error() {}, debug() {} };
 
 /**
  * @typedef {{ seat: number, playerId: string, name: string, isBot: boolean, ready: boolean,
- *             connected: boolean, left: boolean, loadout?: Record<string, { skill: number, module: string|null }> | null,
+ *             connected: boolean, left: boolean, departing?: boolean, loadout?: Record<string, { skill: number, module: string|null }> | null,
  *             ops?: Readonly<Record<string, { potential: number, cultivate: number }>> | null,
  *             notOwned?: readonly string[] | null, diy?: Readonly<Record<string, DiyLoadout>> | null,
  *             skins?: Readonly<Record<string, string>> | null,
@@ -262,13 +270,15 @@ function freezeSkins(skins, hasOperator) {
   return Object.freeze({ ...res.skins });
 }
 
-/** One room: 4 seat slots, host, difficulty, optional running match. */
+/** One room: a bounded capacity, host, difficulty, optional running match. */
 export class Room {
-  /** @param {string} code @param {'solo'|'coop'} mode @param {string} difficulty @param {number} now */
-  constructor(code, mode, difficulty, now) {
+  /** @param {string} code @param {'solo'|'coop'} mode @param {string} difficulty @param {number} now @param {number} [capacity] */
+  constructor(code, mode, difficulty, now, capacity = DEFAULT_SEATS) {
+    if (!ROOM_CAPACITIES.includes(capacity) || (mode === 'solo' && capacity !== DEFAULT_SEATS)) throw new Error('invalid room capacity');
     this.code = code;
     this.mode = mode;
     this.difficulty = difficulty;
+    this.capacity = capacity;
     /**
      * 「AI 队友最后选择」 (room.setAiPicksLast, GitHub #338; co-op only, off by default): the match's strategy and 机变 drafts
      * put every human seat before every AI seat (Match opts.aiPicksLast). Kept across the room's matches.
@@ -277,12 +287,12 @@ export class Room {
     /** @type {string | null} */
     this.hostId = null;
     /** @type {(Seat | null)[]} */
-    this.seats = new Array(MAX_SEATS).fill(null);
+    this.seats = new Array(capacity).fill(null);
     /** @type {{ playerId: string, name: string, connected: boolean }[]} spectator seats, ≤ MAX_SPECTATORS (header) */
     this.spectators = [];
     /** @type {any} running Match instance */
     this.match = null;
-    /** @type {{ live: boolean, ended: boolean, disposed: boolean, match: any } | null} */
+    /** @type {any} lifecycle context: captured lease/roster plus replay frames; never serialized */
     this.matchCtx = null;
     this.matchCount = 0;
     /** @type {any} summary passed to onEnd by the last match */
@@ -342,6 +352,7 @@ export class Room {
       hostId: this.hostId,
       mode: this.mode,
       difficulty: this.difficulty,
+      capacity: this.capacity,
       aiPicksLast: this.aiPicksLast,
       inMatch: !!this.match,
       seats: this.seats.map((s) => (s
@@ -373,7 +384,10 @@ export class Lobby {
    *     releaseContent?: (cs: string) => void, onContentStale?: (fn: (cs: string, ids: string[]) => void) => () => void, onStale?: (fn: (vs: string, ids: string[]) => void) => () => void,
    *     unofficial?: () => number, hasNotices?: () => boolean, defaults?: () => string[], dataOf?: (cs: string) => any, kittedOf?: (cs: string) => any,
    *     contentInUse?: () => number } | null,
-   *   hosts?: { create: (cs: string, opts: object) => any, stats?: () => object } | null,
+   *   hosts?: { checkCreate?: (cs: string) => void, create: (cs: string, opts: object) => any, stats?: () => object } | null,
+   *   auth?: object | null,
+   *   admission?: import('./auth/admission.js').Admission | null,
+   *   isDraining?: (() => boolean) | null,
    *   options?: Partial<typeof LOBBY_DEFAULTS>,
    * }} opts
    *   content: the server's vanilla content (server/plugins/identity.js; header "Content identity"); plugins: what a host
@@ -381,8 +395,12 @@ export class Lobby {
    *   plugins", "Gameplay plugins"); hosts: the match hosts a room with gameplay plugins runs its match in
    *   (server/match/host/index.js; none: such a match runs here, unit tests)
    */
-  constructor({ registry, log = noopLog, MatchClass = DefaultMatch, getData = defaultGetData, now = Date.now, seedFn, content = null, plugins = null, hosts = null, options = {} }) {
+  constructor({ registry, log = noopLog, MatchClass = DefaultMatch, getData = defaultGetData, now = Date.now, seedFn, content = null, plugins = null, hosts = null, auth = null, admission = null, isDraining = null, options = {} }) {
     this.registry = registry;
+    // The real server supplies one authority for every room/host. Null auth keeps the legacy test/platform contract.
+    this.auth = auth;
+    this.admission = admission;
+    this.isDraining = isDraining;
     /** the vanilla content set every room plays (header "Content identity"), or null */
     this.vanilla = content && isContentHash(content.cs) ? Object.freeze({ cs: content.cs, vanilla: true, plugins: Object.freeze([]) }) : null;
     /** the server's room sets — visual and content (header "The room's plugins", "Gameplay plugins"), or null */
@@ -423,14 +441,26 @@ export class Lobby {
     /** log lines said once (warnOnce) */
     this.told = new Set();
     /** a held visual set whose plugins changed on disk: its rooms' hosts are told (header "The room's plugins") */
-    this.offStale = typeof plugins?.onStale === 'function' ? plugins.onStale((vs, ids) => this.pluginsChanged(vs, ids)) : null;
+    this.offStale = null;
+    this.offContentStale = null;
     /**
      * Whether a room applies a change of its plugins on disk by itself (header "The room's plugins"): `({ code, hostId,
      * humans, inMatch }) => boolean`, set by the plugin studio (server/studio/index.js); null — every host is told.
      * @type {((room: { code: string, hostId: string, humans: number, inMatch: boolean }) => boolean) | null}
      */
     this.autoApplyPlugins = null;
-    this.offContentStale = plugins?.onContentStale?.((cs, ids) => this.pluginsChanged(cs, ids, 'content')) || null;
+    try {
+      this.offStale = typeof plugins?.onStale === 'function' ? plugins.onStale((vs, ids) => this.pluginsChanged(vs, ids)) : null;
+      this.offContentStale = plugins?.onContentStale?.((cs, ids) => this.pluginsChanged(cs, ids, 'content')) || null;
+    } catch (e) {
+      // startServer cannot shut down an instance whose constructor never returned. Undo acquired subscriptions here,
+      // and preserve the original construction error even if an unsubscribe also throws.
+      const cleanups = [this.offContentStale, this.offStale];
+      this.offContentStale = null;
+      this.offStale = null;
+      for (const off of cleanups) { try { if (typeof off === 'function') off(); } catch { /* preserve e */ } }
+      throw e;
+    }
   }
 
   /**
@@ -509,7 +539,7 @@ export class Lobby {
   /** @param {string} code @returns {Room | null} */
   getRoom(code) { return this.rooms.get(String(code).toUpperCase()) || null; }
 
-  /** Counters for /healthz. */
+  /** 返回认证健康页的房间、活跃对局与维护状态；不暴露账号或修改房间。 */
   stats() {
     let matches = 0;
     let humans = 0;
@@ -520,7 +550,7 @@ export class Lobby {
       for (const s of r.seats) if (s && !s.left) (s.isBot ? bots++ : humans++);
       spectators += r.spectators.length;
     }
-    return { rooms: this.rooms.size, matches, humans, bots, spectators };
+    return { rooms: this.rooms.size, matches, humans, bots, spectators, draining: this.isDraining?.() ?? false };
   }
 
   // ---------------------------------------------------------------------------------------------------
@@ -530,9 +560,13 @@ export class Lobby {
   /**
    * After `welcome`: resend room state / match state for resumed (or repeated) hellos.
    * @param {import('./net.js').Session} session
-   * @param {{ resumed: boolean, repeat: boolean }} info
+   * @param {{ resumed: boolean, repeat: boolean, isCurrent?: () => boolean }} info
    */
-  onHello(session, { resumed, repeat }) {
+  onHello(session, info) {
+    const { resumed, repeat } = info;
+    // Internal callers need no network context; when net supplies one, retain its original guard through resync queues.
+    const ctx = Object.hasOwn(info, 'isCurrent') ? this.messageContext(info) : null;
+    if (ctx && !this.messageCurrent(ctx)) return;
     if (!resumed && !repeat) return;
     const room = this.roomOf(session);
     if (!room) {
@@ -559,7 +593,7 @@ export class Lobby {
     if (!room.hostId) { this.migrateHost(room); changed = true; }
     if (changed) this.broadcastState(room);
     else this.sendState(room, session);
-    this.resync(session, !resumed);
+    this.resync(session, !resumed, ctx);
   }
 
   /**
@@ -568,15 +602,31 @@ export class Lobby {
    * replies when it settles).
    * @param {import('./net.js').Session} session
    * @param {any} msg
+   * @param {{ isCurrent: () => boolean } | null} [context] captured by net.js for the original connection/identity
    * @returns {{ ok: true } | { error: string, detail?: string } | Promise<{ ok: true } | { error: string, detail?: string }>}
    */
-  onMessage(session, msg) {
+  onMessage(session, msg, context = null) {
     const room = this.queuedRoom(session);
-    if (!room) return this.handleMessage(session, msg);
-    // a queued room.contentReady speaks for the page that sent it: the seat and its generation now — a disconnect in
-    // between bumps it, and the page that comes back checks the set again (contentReady)
-    const ctx = msg && msg.t === 'room.contentReady' ? { from: this.seatGen(room, session.playerId) } : null;
-    return this.serial(room, () => this.handleMessage(session, msg, ctx));
+    // Keep the original guard, not a fresh check of whichever socket owns this Session when the queue drains.
+    // A contentReady also speaks for the seat generation of the page that sent it (contentReady).
+    const ctx = this.messageContext(context, room && msg?.t === 'room.contentReady' ? this.seatGen(room, session.playerId) : null);
+    const execute = () => this.messageCurrent(ctx) ? this.handleMessage(session, msg, ctx) : fail(ERR.AUTH_REQUIRED);
+    return room ? this.serial(room, execute) : execute();
+  }
+
+  /** Capture once at ingress; never replace a queued message's network context with a later connection's. */
+  messageContext(context, from = null) {
+    let isCurrent = null;
+    try { isCurrent = context?.isCurrent; } catch { isCurrent = false; /* malformed external context fails closed */ }
+    return Object.freeze({ network: context, isCurrent, from });
+  }
+
+  /** Only external message execution needs a guard. Lifecycle events (hello/disconnect/expiry) remain internal. */
+  messageCurrent(ctx) {
+    const guard = ctx?.isCurrent;
+    if (guard == null) return this.auth === null;
+    if (typeof guard !== 'function') return false;
+    try { return guard() === true; } catch { return false; }
   }
 
   /** A seat (or spectator seat) of `room` and its content generation (header "Gameplay plugins"), or null. */
@@ -627,19 +677,21 @@ export class Lobby {
   }
 
   /**
-   * One message (onMessage), now. `ctx`: what onMessage noted when it queued the message (a contentReady's seat
-   * generation), else null.
+   * 在串行队列内处理当前消息；维护期间阻止新开局，保留原连接和席位代际校验。
    * @param {import('./net.js').Session} session
    * @param {any} msg
-   * @param {{ from?: { seat: Seat, gen: number } | null } | null} [ctx]
+   * @param {{ isCurrent?: (() => boolean) | null, network?: object | null, from?: { seat: Seat, gen: number } | null } | null} [ctx]
    */
   handleMessage(session, msg, ctx = null) {
+    // 排空只禁止新增房间、加入及启动；不切断既有比赛、重连、结算或离开流程。
+    if (['room.create', 'room.join', 'room.start'].includes(msg.t) && this.isDraining?.()) return fail(ERR.MAINTENANCE);
     switch (msg.t) {
       case 'room.create': return this.create(session, msg);
       case 'room.join': return this.join(session, msg);
       case 'room.leave': return this.leave(session);
       case 'room.ready': return this.ready(session, msg);
       case 'room.setDifficulty': return this.setDifficulty(session, msg);
+      case 'room.setCapacity': return this.setCapacity(session, msg);
       case 'room.setAiPicksLast': return this.setAiPicksLast(session, msg);
       case 'room.addBot': return this.addBot(session);
       case 'room.removeBot': return this.removeBot(session, msg);
@@ -658,7 +710,7 @@ export class Lobby {
       case 'room.contentReady': return this.contentReady(session, msg, ctx);
       case 'room.consent': return this.consent(session,msg);
       default:
-        if (typeof msg.t === 'string' && msg.t.startsWith('g.')) return this.routeGameNow(session, msg);
+        if (typeof msg.t === 'string' && msg.t.startsWith('g.')) return this.routeGameNow(session, msg, ctx);
         return fail(ERR.BAD_MSG, `unhandled type ${String(msg.t).slice(0, 32)}`);
     }
   }
@@ -667,8 +719,8 @@ export class Lobby {
   onDisconnect(session) {
     this.clearResync(session.playerId); // the next resume resyncs immediately
     const room = this.roomOf(session);
-    // a solo run may be resumed within singleReconnectTime (24 h); everything else keeps the registry's window
-    session.resumeWindowMs = room && room.match && room.mode === 'solo' ? this.soloResumeWindowMs() : null;
+    // Authenticated matches share the registry's 10-minute window, including solo; null-auth keeps official solo resume.
+    session.resumeWindowMs = this.auth === null && room && room.match && room.mode === 'solo' ? this.soloResumeWindowMs() : null;
     if (!room) return;
     const player = room.seatOf(session.playerId);
     const seat = player || room.spectatorOf(session.playerId);
@@ -696,9 +748,16 @@ export class Lobby {
     this.clearResync(session.playerId);
     const code = session.roomCode;
     const room = code ? this.rooms.get(code) : null;
+    // sweep already removed this Session: permanent departure uses the original match context's account mapping.
+    const matchCtx = room?.matchCtx;
     // in order with the room's messages when its match runs in a match host (header "Gameplay plugins")
     if (room && this.queuedRoom(session)) {
-      this.queueEvent(room, () => { if (session.roomCode === code) session.roomCode = null; this.removeMember(room, session.playerId); });
+      this.queueEvent(room, () => {
+        // An old queued expiry cannot turn a seat in a later match into a permanent departure.
+        if (room.matchCtx && room.matchCtx !== matchCtx) return;
+        if (session.roomCode === code) session.roomCode = null;
+        return this.removeMember(room, session.playerId);
+      });
       return;
     }
     session.roomCode = null;
@@ -710,11 +769,15 @@ export class Lobby {
    * @param {string} [reason]
    */
   shutdown(reason = 'shutdown') {
-    this.offStale?.();
-    this.offContentStale?.();
+    const subscriptions = [this.offContentStale, this.offStale];
     this.offStale = null;
     this.offContentStale = null;
-    for (const room of [...this.rooms.values()]) this.disposeRoom(room, reason);
+    for (const off of subscriptions) {
+      try { if (typeof off === 'function') off(); } catch (e) { this.log.error('[lobby] plugin unsubscribe failed', e); }
+    }
+    for (const room of [...this.rooms.values()]) {
+      try { this.disposeRoom(room, reason); } catch (e) { this.log.error(`[lobby] ${room.code} room cleanup failed`, e); }
+    }
     for (const t of this.graceTimers.values()) clearTimeout(t);
     this.graceTimers.clear();
     for (const t of this.resyncTimers.values()) clearTimeout(t);
@@ -725,7 +788,8 @@ export class Lobby {
   // room.* handlers
   // ---------------------------------------------------------------------------------------------------
 
-  create(session, { mode, difficulty, test } = {}) {
+  create(session, { mode, difficulty, capacity = DEFAULT_SEATS, test } = {}) {
+    if (!ROOM_CAPACITIES.includes(capacity) || (mode === 'solo' && capacity !== DEFAULT_SEATS)) return fail(ERR.BAD_MSG, 'invalid room capacity');
     // A test room exists only when the process switch allowed it. The check runs before the room is built.
     if (test === true && this.testEnabled !== true) return fail(ERR.TEST_DISABLED);
     const cur = this.roomOf(session);
@@ -743,7 +807,7 @@ export class Lobby {
     const code = this.genCode();
     if (!code) return fail(ERR.INTERNAL, 'no room code available');
     if (cur) this.removeMember(cur, session.playerId);
-    const room = new Room(code, mode, difficulty, this.now());
+    const room = new Room(code, mode, difficulty, this.now(), capacity);
     room.test = test === true;
     room.content = this.vanilla;
     // the server owner's default plugins (plugins/config.json `default`; header "Gameplay plugins"): none — the original game
@@ -791,8 +855,7 @@ export class Lobby {
   leave(session) {
     const room = this.roomOf(session);
     if (!room) return fail(ERR.NOT_IN_ROOM);
-    this.removeMember(room, session.playerId);
-    return OK;
+    return this.removeMember(room, session.playerId) || OK;
   }
 
   /**
@@ -867,6 +930,25 @@ export class Lobby {
     if (room.difficulty !== difficulty || room.content?.modeId) {
       room.difficulty = difficulty;
       if (room.content?.modeId) { const rest = { ...room.content }; delete rest.modeId; room.content = Object.freeze(rest); }
+      for (const s of room.seats) if (s && !s.isBot && s.playerId !== room.hostId) s.ready = false;
+      this.broadcastState(room);
+    }
+    return OK;
+  }
+
+  /** Capacity changes never move or evict an occupied seat, including a disconnected player's reserved seat. */
+  setCapacity(session, { capacity }) {
+    const room = this.roomOf(session);
+    if (!room) return fail(ERR.NOT_IN_ROOM);
+    if (room.hostId !== session.playerId) return fail(ERR.NOT_HOST);
+    if (room.match) return fail(ERR.ROOM_STARTED);
+    if (room.mode === 'solo') return fail(ERR.BAD_TARGET, 'solo room capacity is fixed');
+    if (!ROOM_CAPACITIES.includes(capacity)) return fail(ERR.BAD_MSG, 'invalid room capacity');
+    if (room.seats.slice(capacity).some((s) => s !== null)) return fail(ERR.ROOM_FULL, 'higher seats are still occupied');
+    if (room.capacity !== capacity) {
+      this.dropReplay(room, session.playerId);
+      room.seats = Array.from({ length: capacity }, (_, i) => room.seats[i] || null);
+      room.capacity = capacity;
       for (const s of room.seats) if (s && !s.isBot && s.playerId !== room.hostId) s.ready = false;
       this.broadcastState(room);
     }
@@ -1118,6 +1200,7 @@ export class Lobby {
     if (room.hostId !== session.playerId) return fail(ERR.NOT_HOST);
     if (room.match) return fail(ERR.ROOM_STARTED);
     const humans = room.activeHumans();
+    if (!ROOM_CAPACITIES.includes(room.capacity) || room.seats.length !== room.capacity || room.capacity > MAX_SEATS) return fail(ERR.BAD_MSG, 'invalid room capacity');
     if (room.content?.trusted && humans.some(s => s.consentCs !== room.content.cs)) return fail(ERR.PLUGIN_CONSENT);
     for (const s of humans) {
       if (s.playerId !== room.hostId && (!s.connected || !s.ready)) return fail(ERR.NOT_READY);
@@ -1343,6 +1426,7 @@ export class Lobby {
     }
     // Omitted when the switch is off, so a welcome from a normal server stays identical.
     if (this.testEnabled === true) info.testMode = true;
+    info.roomCapacity = { version: 1, default: DEFAULT_SEATS, max: MAX_SEATS, supported: ROOM_CAPACITIES };
     return info;
   }
 
@@ -1350,61 +1434,91 @@ export class Lobby {
   // Match wiring
   // ---------------------------------------------------------------------------------------------------
 
-  /** @param {Room} room @param {string | null} [key] per-network limit key of the starter */
+  /** 为房间构建并启动对局；维护检查在预留账号、机器人额度之前执行，失败不消耗名额。 */
   startMatch(room, key = null) {
+    if (this.isDraining?.()) return fail(ERR.MAINTENANCE);
     if (room.test && !this.testEnabled) return fail(ERR.TEST_DISABLED);
     const host = room.seatOf(room.hostId);
     if (host) host.ready = true;
-    // the room's data: its content set's in a room with gameplay plugins (header "Gameplay plugins")
-    const data = this.dataFor(room);
-    const seats = room.seats.filter(Boolean).map((s) => {
-      // a setting checked for another content is filtered to this room's data (header "Gameplay plugins")
-      const own = s.isBot ? null : this.seatSettings(room, s, data);
-      return {
-        seat: s.seat, playerId: s.playerId, name: s.name, isBot: s.isBot, connected: s.connected,
-        // DESIGN §16: the human's checked operator loadout and (0.2.2) per-operator 潜能 / 练度 (bots fight with the defaults)
-        loadout: own ? own.loadout : null,
-        ops: own ? own.ops : null,
-        // 0.2.0 补位: the chess the human marked as not owned (bots own every operator)
-        notOwned: own ? own.notOwned : null,
-        // 0.2.0 自选编队: the human's checked DIY picks (bots field no 自选 piece [ASSUMED])
-        diy: own ? own.diy : null,
-        // 干员皮肤 (docs/SKINS.md): the appearances the human wears, keyed by operator charId (bots always default)
-        skins: own ? own.skins : null,
-      };
-    });
-    // lastPublic / results: the latest m.public broadcast and the m.result frames (encoded), kept for the replay.
-    const ctx = { live: true, ended: false, disposed: false, match: null, lastPublic: null, sharedResult: null, results: new Map() };
-    let seed = 0;
-    try { seed = this.seedFn() >>> 0; } catch { seed = randomInt(2 ** 32); }
+    // Each lifecycle callback captures this context, never the room's next match or a fresh registry account lookup.
+    const ctx = {
+      live: true, ended: false, disposed: false, match: null,
+      lastPublic: null, sharedResult: null, results: new Map(),
+      admission: this.auth === null ? null : this.admission,
+      lease: null, accountByPlayer: null, roster: null, admissionReleased: false,
+    };
     const modded = room.modded;
     try {
+      // Resource preflight is synchronous and side-effect-free; create below rechecks after admission.
+      // Null-auth keeps the original host startup/seed ordering.
+      if (this.auth !== null && modded && this.hosts) {
+        if (typeof this.hosts.checkCreate !== 'function') throw new Error('match host has no resource preflight');
+        this.hosts.checkCreate(room.content.cs);
+      }
+      // The room's data and checked settings are obtained before reserving or constructing a match.
+      const data = this.dataFor(room);
+      const seats = room.seats.filter((s) => s && (this.auth === null || !s.left)).map((s) => {
+        const own = s.isBot ? null : this.seatSettings(room, s, data);
+        const seat = {
+          seat: s.seat, playerId: s.playerId, name: s.name, isBot: s.isBot, connected: s.connected,
+          loadout: own ? own.loadout : null,
+          ops: own ? own.ops : null,
+          notOwned: own ? own.notOwned : null,
+          diy: own ? own.diy : null,
+          skins: own ? own.skins : null,
+        };
+        return this.auth === null ? seat : Object.freeze(seat);
+      });
+      if (this.auth !== null) {
+        if (!ctx.admission) throw new Error('authenticated lobby requires central admission');
+        const accountByPlayer = Object.create(null);
+        const accountIds = [];
+        const seen = new Set();
+        for (const seat of seats) {
+          if (seat.isBot) continue;
+          const accountId = this.registry.byId(seat.playerId)?.accountId;
+          if (typeof accountId !== 'string' || !accountId.length || accountId.length > 256 || accountId.trim() !== accountId) {
+            return fail(ERR.AUTH_REQUIRED, 'every human seat requires an authenticated account');
+          }
+          // Do not deduplicate: two human seats claiming one account must never consume just one slot.
+          if (seen.has(accountId)) return fail(ERR.ACCOUNT_BUSY, 'an account occupies more than one seat');
+          seen.add(accountId);
+          accountIds.push(accountId);
+          accountByPlayer[seat.playerId] = accountId;
+        }
+        Object.freeze(seats);
+        const lease = ctx.admission.reserve(`lobby-${++admissionMatchSeq}-${room.code}-${room.matchCount + 1}`, {
+          accountIds, botIds: seats.filter((s) => s.isBot).map((s) => s.playerId),
+        });
+        ctx.lease = lease; // rollback can already find the token if any later option/construction step throws
+        // The lease/token and admitted identities cannot drift while an asynchronous host is starting or leaving.
+        Object.defineProperties(ctx, {
+          lease: { value: lease, writable: false, configurable: false },
+          accountByPlayer: { value: Object.freeze(accountByPlayer), writable: false, configurable: false },
+          roster: { value: seats, writable: false, configurable: false },
+          admission: { value: ctx.admission, writable: false, configurable: false },
+        });
+      }
+      let seed = 0;
+      try { seed = this.seedFn() >>> 0; } catch { seed = randomInt(2 ** 32); }
       const opts = {
         roomCode: room.code,
         mode: room.mode,
         difficulty: room.difficulty,
-        // a plugin mode the host chose (header "Gameplay plugins"), else the official mode of the difficulty
+        // A plugin mode the host chose, else the official mode of the difficulty.
         modeId: room.content?.modeId || modeIdFor(room.mode, room.difficulty),
-        // 「AI 队友最后选择」 (GitHub #338): fixed for the match
         aiPicksLast: room.mode !== 'solo' && room.aiPicksLast === true,
+        runtimeContext: Object.freeze({ version: 1, capacity: room.capacity, participantCount: seats.length, personalPools: seats.length > DEFAULT_SEATS }),
         seats,
-        // the spectator seats (header): watched like eliminated players, never players
+        // Spectators never consume human admission and are never part of the admitted player roster.
         spectators: room.spectators.map((s) => s.playerId),
-        // the room's host: the current executor of a delegated bot layout rehearsal (DESIGN §14; setHost follows a
-        // migration while the match runs)
         hostId: room.hostId,
-        // only a room created as a test room; a normal match opts object does not grow a test key
         ...(room.test === true ? { test: true } : {}),
         seed,
-        // the room's match number: with the seed it keeps battleIds unique across the room's matches (DESIGN §14)
         matchNo: room.matchCount + 1,
-        // the room's content hash (header "Content identity"): copied into every BattleSpec; its visual set too (a
-        // replay names the art), and with gameplay plugins a b.result must name the room's cs (header "Gameplay plugins")
         ...(room.content ? { cs: room.content.cs } : {}),
         ...(room.content?.vs ? { vs: room.content.vs } : {}),
         ...(modded ? { requireCs: true } : {}),
-        // The list the lobby just checked the picks with (kittedFor). Vanilla rooms omit it: setDiy stays on
-        // KITTED_CHARS, and the worker payload / test journal of a normal match do not grow a key.
         ...(modded ? { kitted: this.kittedFor(room) } : {}),
         ...(room.content?.rules ? { rules: room.content.rules } : {}),
         data,
@@ -1414,7 +1528,6 @@ export class Lobby {
         broadcast: (msg) => { if (ctx.live) this.matchBroadcast(room, ctx, msg); },
         onEnd: (summary) => this.onMatchEnd(room, ctx, summary),
       };
-      // a room with gameplay plugins plays in its content set's match host; every other room here, as always
       const match = modded && this.hosts ? this.hosts.create(room.content.cs, opts) : new this.MatchClass(opts);
       ctx.match = match;
       room.match = match;
@@ -1424,22 +1537,37 @@ export class Lobby {
       room.matchCount++;
       this.log.info(`[lobby] ${room.code} match #${room.matchCount} starting (${room.mode}/${room.difficulty}, ${seats.length} seats, seed ${seed}${room.test ? ', test' : ''}${modded ? `, content ${room.content.cs.slice(0, 8)}${match.hosted ? ' in its match host' : ''}` : ''})`);
       this.broadcastState(room);
-      match.start();
+      // start may end synchronously, or a hosted implementation may acknowledge/reject startup later.
+      const started = match.start();
+      if (started && typeof started.then === 'function') {
+        return Promise.resolve(started).then((answer) => answer?.error
+          ? this.startFailed(room, ctx, answer)
+          : OK, (e) => this.startFailed(room, ctx, e));
+      }
+      if (started?.error) return this.startFailed(room, ctx, started);
     } catch (e) {
-      this.log.error(`[lobby] ${room.code} match failed to start`, e);
-      if (room.matchCtx === ctx) { room.match = null; room.matchCtx = null; room.matchKey = null; }
-      this.disposeMatchCtx(ctx);
-      this.broadcastState(room);
-      // the match hosts refuse one content set more than they run (PLUGIN_BUSY: server/match/host/index.js)
-      return fail(e && isErrCode(e.code) ? e.code : ERR.INTERNAL, 'match failed to start');
+      return this.startFailed(room, ctx, e);
     }
     return OK;
+  }
+
+  /** Roll back only the captured start attempt, even if onEnd already ran and the room started a newer match. */
+  startFailed(room, ctx, error) {
+    this.log.error(`[lobby] ${room.code} match failed to start`, error);
+    if (room.matchCtx === ctx) { room.match = null; room.matchCtx = null; room.matchKey = null; }
+    this.disposeMatchCtx(ctx, true);
+    this.broadcastState(room);
+    const code = error instanceof AdmissionError
+      ? (error.code === 'full' ? ERR.SERVER_FULL : error.code === 'busy' ? ERR.ACCOUNT_BUSY : ERR.BAD_MSG)
+      : (error && isErrCode(error.code ?? error.error) ? (error.code ?? error.error) : ERR.INTERNAL);
+    return fail(code, 'match failed to start');
   }
 
   /** onEnd callback: return the room to LOBBY and dispose the match on the next macrotask. */
   onMatchEnd(room, ctx, summary) {
     if (ctx.ended || !ctx.live || room.matchCtx !== ctx || room.disposed) return;
     ctx.ended = true;
+    this.releaseAdmission(ctx);
     room.lastSummary = summary ?? null;
     room.match = null;
     room.matchCtx = null;
@@ -1452,7 +1580,12 @@ export class Lobby {
     for (let i = 0; i < room.seats.length; i++) {
       const s = room.seats[i];
       if (!s || s.isBot) continue;
-      if (s.left) { room.seats[i] = null; continue; }
+      if (s.left || s.departing) {
+        const session = this.registry.byId(s.playerId);
+        if (session?.roomCode === room.code) session.roomCode = null;
+        room.seats[i] = null;
+        continue;
+      }
       s.ready = false;
       if (!s.connected) this.startGrace(room, s);
     }
@@ -1492,7 +1625,7 @@ export class Lobby {
   buildReplay(room, ctx) {
     const frames = new Map();
     for (const s of [...room.seats, ...room.spectators]) {
-      if (!s || s.isBot || s.left) continue;
+      if (!s || s.isBot || s.left || s.departing) continue;
       const frame = ctx.results.get(s.playerId) || ctx.sharedResult;
       if (frame) frames.set(s.playerId, frame);
     }
@@ -1521,13 +1654,13 @@ export class Lobby {
    * (requests inside the window coalesce into one deferred resync).
    * @param {import('./net.js').Session} session @param {boolean} coalesce
    */
-  resync(session, coalesce) {
+  resync(session, coalesce, ctx = null) {
     const pid = session.playerId;
     if (coalesce) {
       if (this.resyncTimers.has(pid)) return; // the scheduled resync answers this request too
       const wait = (Number.isFinite(session.resyncAt) ? session.resyncAt : -Infinity) + this.opts.resyncMinGapMs - this.now();
       if (wait > 0) {
-        const t = setTimeout(() => { this.resyncTimers.delete(pid); this.runResync(session); }, wait);
+        const t = setTimeout(() => { this.resyncTimers.delete(pid); this.runResync(session, ctx); }, wait);
         t.unref?.();
         this.resyncTimers.set(pid, t);
         return;
@@ -1535,21 +1668,23 @@ export class Lobby {
     } else {
       this.clearResync(pid);
     }
-    this.runResync(session);
+    this.runResync(session, ctx);
   }
 
   /** @param {import('./net.js').Session} session */
-  runResync(session) {
+  runResync(session, ctx = null) {
+    if (ctx && !this.messageCurrent(ctx)) return;
     if (!session.connected || this.registry.byId(session.playerId) !== session) return;
     const room = this.roomOf(session);
     if (!room) return;
     // in order with the room's messages when its match runs in a match host (header "Gameplay plugins")
-    if (this.queuedRoom(session)) { this.queueEvent(room, () => this.resyncNow(session)); return; }
-    this.resyncNow(session);
+    if (this.queuedRoom(session)) { this.queueEvent(room, () => this.resyncNow(session, ctx)); return; }
+    this.resyncNow(session, ctx);
   }
 
   /** runResync, now. @param {import('./net.js').Session} session */
-  resyncNow(session) {
+  resyncNow(session, ctx = null) {
+    if (ctx && !this.messageCurrent(ctx)) return;
     if (!session.connected || this.registry.byId(session.playerId) !== session) return;
     const room = this.roomOf(session);
     if (!room) return;
@@ -1595,13 +1730,15 @@ export class Lobby {
    * Route a 'g.*' intent or a 'b.*' report (server/net.js) to the running match — on the room's queue when its match runs
    * in a match host (header "Gameplay plugins").
    */
-  routeGame(session, msg) {
+  routeGame(session, msg, context = null) {
     const room = this.queuedRoom(session);
-    return room ? this.serial(room, () => this.routeGameNow(session, msg)) : this.routeGameNow(session, msg);
+    const ctx = this.messageContext(context);
+    const execute = () => this.messageCurrent(ctx) ? this.routeGameNow(session, msg, ctx) : fail(ERR.AUTH_REQUIRED);
+    return room ? this.serial(room, execute) : execute();
   }
 
-  /** routeGame, now. */
-  routeGameNow(session, msg) {
+  /** routeGame, now; its wrapper (or onMessage) just checked the captured guard before invoking it. */
+  routeGameNow(session, msg, ctx = null) {
     const room = this.roomOf(session);
     if (!room) return fail(ERR.NOT_IN_ROOM);
     if (msg.t === 'g.test') {
@@ -1609,10 +1746,7 @@ export class Lobby {
       if (room.test !== true) return fail(ERR.TEST_FORBIDDEN);
     }
     if (!room.match) return fail(ERR.WRONG_PHASE, 'no running match');
-    if (msg.t === 'g.leave') {
-      this.removeMember(room, session.playerId);
-      return OK;
-    }
+    if (msg.t === 'g.leave') return this.removeMember(room, session.playerId) || OK;
     // a spectator only watches (header): nothing else of it ever reaches the match
     if (msg.t !== 'g.watch' && !(room.test && msg.t === 'g.test') && room.spectatorOf(session.playerId)) return fail(ERR.SPECTATOR);
     let res;
@@ -1653,11 +1787,56 @@ export class Lobby {
     }
   }
 
-  disposeMatchCtx(ctx) {
+  /** Release only the original reservation; repeated end/dispose/rollback calls and stale callbacks are harmless. */
+  releaseAdmission(ctx, rollback = false) {
+    if (!ctx?.lease || ctx.admissionReleased) return;
+    ctx.admissionReleased = true;
+    try {
+      if (rollback) ctx.admission.rollback(ctx.lease.token);
+      else ctx.admission.releaseMatch(ctx.lease.token);
+    } catch (e) { this.log.error('[lobby] admission cleanup failed', e); }
+  }
+
+  disposeMatchCtx(ctx, rollback = false) {
+    if (!ctx) return;
+    this.releaseAdmission(ctx, rollback);
     if (ctx.disposed) return;
     ctx.disposed = true;
     ctx.live = false;
     try { ctx.match?.dispose?.(); } catch (e) { this.log.error('[lobby] match.dispose threw', e); }
+  }
+
+  /**
+   * An authenticated permanent departure needs the real onLeave, never callMatch's onDisconnect fallback.
+   * A local void return confirms the synchronous hook; a hosted hook must return an acknowledged {ok:true} Promise.
+   */
+  confirmLeave(room, ctx, playerId) {
+    const match = ctx?.match || room.match;
+    if (!match || typeof match.onLeave !== 'function') return fail(ERR.INTERNAL, 'match cannot confirm permanent departure');
+    let result;
+    try { result = match.onLeave(playerId); } catch (e) {
+      this.log.error(`[lobby] ${room.code} match.onLeave threw`, e);
+      return fail(ERR.INTERNAL, 'match did not confirm permanent departure');
+    }
+    const confirmed = (answer) => {
+      if (answer?.error || (match.hosted === true && answer?.ok !== true)) return matchAnswer(answer?.error ? answer : { error: ERR.INTERNAL });
+      // No registry lookup here: expiry has removed the Session, and this account might already have a NEW lease.
+      const accountId = ctx?.accountByPlayer?.[playerId];
+      if (accountId && !ctx.admissionReleased) ctx.admission.releaseAccount(ctx.lease.token, accountId);
+      return OK;
+    };
+    if (result && typeof result.then === 'function') {
+      if (match.hosted !== true) {
+        Promise.resolve(result).catch((e) => this.log.error(`[lobby] ${room.code} match.onLeave rejected`, e));
+        return fail(ERR.INTERNAL, 'local match did not confirm synchronous permanent departure');
+      }
+      return Promise.resolve(result).then(confirmed, (e) => {
+        this.log.error(`[lobby] ${room.code} match.onLeave rejected`, e);
+        return fail(ERR.INTERNAL, 'match did not confirm permanent departure');
+      });
+    }
+    if (match.hosted === true) return fail(ERR.INTERNAL, 'match host did not acknowledge permanent departure');
+    return confirmed(result);
   }
 
   safeData() {
@@ -1711,12 +1890,40 @@ export class Lobby {
    */
   removeMember(room, playerId) {
     const session = this.registry.byId(playerId);
-    if (session && session.roomCode === room.code) session.roomCode = null;
+    const detach = () => { if (session && session.roomCode === room.code) session.roomCode = null; };
     this.clearGrace(playerId);
     this.dropReplay(room, playerId);
-    if (this.freeSpectatorSeat(room, playerId)) return;
+    if (room.spectatorOf(playerId)) { detach(); this.freeSpectatorSeat(room, playerId); return; }
     const seat = room.seatOf(playerId);
-    if (!seat || seat.isBot || seat.left || room.disposed) return;
+    if (!seat || seat.isBot || seat.left || room.disposed) { detach(); return; }
+    const ctx = room.matchCtx;
+    if (room.match && this.auth !== null) {
+      const before = { connected: seat.connected, ready: seat.ready };
+      // onLeave may synchronously end the match; onMatchEnd recognizes the captured pending departure too.
+      seat.departing = true;
+      seat.connected = false;
+      seat.ready = false;
+      const finish = (answer) => {
+        // End/dispose already cleared this seat. Never detach a session or migrate a newer match from an old reply.
+        if (room.disposed || room.matchCtx !== ctx) return answer;
+        delete seat.departing;
+        if (answer?.error) {
+          // No acknowledgement: keep the account reserved and this membership available for a retry/resync.
+          seat.connected = session ? session.connected : before.connected;
+          seat.ready = before.ready;
+          this.broadcastState(room);
+          return answer;
+        }
+        seat.left = true;
+        detach();
+        this.memberRemoved(room, playerId);
+        return answer;
+      };
+      const answer = this.confirmLeave(room, ctx, playerId);
+      return answer && typeof answer.then === 'function' ? Promise.resolve(answer).then(finish) : finish(answer);
+    }
+    // Null-auth retains the original optional-hook/onDisconnect fallback and synchronous room behavior.
+    detach();
     if (room.match) {
       seat.left = true;
       seat.connected = false;
@@ -1725,6 +1932,10 @@ export class Lobby {
     } else {
       room.seats[seat.seat] = null;
     }
+    this.memberRemoved(room, playerId);
+  }
+
+  memberRemoved(room, playerId) {
     if (room.disposed) return; // onLeave may have ended the match and emptied the room
     if (room.hostId === playerId) this.migrateHost(room);
     if (room.activeHumans().length === 0) this.disposeRoom(room, 'empty');
@@ -1788,12 +1999,18 @@ export class Lobby {
   disposeRoom(room, reason) {
     if (room.disposed) return;
     room.disposed = true;
-    if (this.rooms.get(room.code) === room) { this.trustedRuntime?.event('roomClosed',{room:room.toState()}); this.rooms.delete(room.code); }
+    if (this.rooms.get(room.code) === room) {
+      try { this.trustedRuntime?.event('roomClosed', { room: room.toState() }); }
+      catch (e) { this.log.error(`[lobby] ${room.code} roomClosed observer failed`, e); }
+      this.rooms.delete(room.code);
+    }
     const ctx = room.matchCtx;
     room.match = null;
     room.matchCtx = null;
     room.matchKey = null;
     room.replay = null;
+    // Auth cleanup cannot be skipped by an optional observer/session failure. Null-auth keeps its original disposal order.
+    if (ctx && this.auth !== null) this.disposeMatchCtx(ctx);
     for (const s of room.seats) {
       if (!s || s.isBot) continue;
       this.clearGrace(s.playerId);
@@ -1813,7 +2030,7 @@ export class Lobby {
       if (session.connected) sendSession(session, { t: 'room.closed', reason });
       else session.notice = reason;
     }
-    if (ctx) this.disposeMatchCtx(ctx);
+    if (ctx && this.auth === null) this.disposeMatchCtx(ctx);
     // the room's visual set and content set are no longer held by it (server/plugins/visualSet.js, contentSets.js)
     this.releaseContent(room.content);
     this.log.info(`[lobby] ${room.code} disposed (${reason})`);

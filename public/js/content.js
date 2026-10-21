@@ -44,7 +44,7 @@
 //     it: a switched-on personal plugin, the room's 插件 panel (ui/pluginPanel.js), 设置's 外观插件 (ui/settings.js) or
 //     the list behind the title screen's 「本服务器安装了 N 个插件」 (that count is the server's).
 
-import { createStore, loadPref, savePref, store as appStore } from './store.js';
+import { createStore, loadPref, savePref, prefStorageKey, store as appStore } from './store.js';
 import { data as dataStore } from './data.js';
 import { net as appNet } from './net.js';
 import { cosmetics, loadVisual, visualNow } from './cosmetics.js';
@@ -630,12 +630,16 @@ export function contentHooks({ dev = DEV_BUILD, nav = globalThis.navigator ?? nu
   return hooks;
 }
 
-// Consent is this browser's explicit choice, independent of other seats and of server assertions.
+// Consent belongs to this verified account in this browser, never another account or an old guest.
 const pageScripts = new Set(), pageConsent = new Set();
 export function hasScriptConsent(cs, storage) {
-  try { return pageConsent.has(cs) || (storage ?? globalThis.localStorage)?.getItem('sp.plugin.consent.'+cs) === 'yes'; } catch { return pageConsent.has(cs); }
+  const key = isContentHash(cs) ? prefStorageKey('plugin.consent.' + cs) : null;
+  if (!key) return false;
+  try { return pageConsent.has(key) || (storage ?? globalThis.localStorage)?.getItem(key) === 'yes'; } catch { return pageConsent.has(key); }
 }
 export function rememberScriptConsent(cs, accept, storage) {
-  if (accept) pageConsent.add(cs); else pageConsent.delete(cs);
-  try { storage ??= globalThis.localStorage; if (accept) storage?.setItem('sp.plugin.consent.'+cs,'yes'); else storage?.removeItem('sp.plugin.consent.'+cs); } catch { /* storage unavailable */ }
+  const key = isContentHash(cs) ? prefStorageKey('plugin.consent.' + cs) : null;
+  if (!key) return;
+  if (accept) pageConsent.add(key); else pageConsent.delete(key);
+  try { storage ??= globalThis.localStorage; if (accept) storage?.setItem(key, 'yes'); else storage?.removeItem(key); } catch { /* storage unavailable */ }
 }

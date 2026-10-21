@@ -2,6 +2,9 @@
 // tools/doctor.mjs — diagnose an install (docs/DEPLOY.md「排错」). Read-only: changes nothing.
 //
 //   node tools/doctor.mjs [--port 3000] [--host ::]
+//   node tools/doctor.mjs --auth-stdin --port <port> --host 127.0.0.1
+//     Strict server-only probe: bounded JSON {"cookie":"..."} on stdin, never arguments/env/files.
+//     This mode does not scan this machine's clients, firewall or tools. Ordinary diagnostics are unchanged.
 //
 // Checks: Node/npm versions, dependencies, public/vendor, data/*.json, the shipped files against the release's
 // MANIFEST.json (server/update.js checkInstall; a source checkout has none) and an update package not applied yet,
@@ -115,16 +118,82 @@ export const KIND_LABEL = { lan: '局域网', vpn: 'VPN/Tailscale/ZeroTier', pub
 // Port probe
 // ---------------------------------------------------------------------------------------------------
 
-function getJson(url, timeoutMs = 1500) {
+const AUTH_INPUT_LIMIT = 8192;
+const invalidAuthInput = () => new Error('Invalid --auth-stdin input');
+
+/** A complete authenticated report, not anonymous {ok} readiness. */
+export function isFullHealth(json) {
+  return !!json && json.ok === true && Number.isInteger(json.version) && json.version > 0 &&
+    typeof json.app === 'string' && json.app.length > 0 && typeof json.build === 'string' && json.build.length > 0 &&
+    ['uptimeSec', 'rooms', 'matches', 'sockets', 'sessions'].every(key => Number.isFinite(json[key]) && json[key] >= 0);
+}
+
+/** Only cookies from the smoke's HTTP flow, never file names, URLs or deployment secrets. */
+export function parseProbeInput(text) {
+  if (typeof text !== 'string' || Buffer.byteLength(text) > AUTH_INPUT_LIMIT) throw invalidAuthInput();
+  let value;
+  try { value = JSON.parse(text); } catch { throw invalidAuthInput(); }
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 1 ||
+      typeof value.cookie !== 'string' || /[\u0000-\u001f\u007f]/.test(value.cookie)) throw invalidAuthInput();
+  const parts = value.cookie.split(';').map(part => part.trim());
+  const names = new Set();
+  for (const part of parts) {
+    const match = /^(sp_gate|sp_session|sp_csrf)=[A-Za-z0-9_.-]+$/.exec(part);
+    if (!match || names.has(match[1])) throw invalidAuthInput();
+    names.add(match[1]);
+  }
+  if (names.size !== 3) throw invalidAuthInput();
+  return { cookie: value.cookie };
+}
+
+/** Bounded non-interactive stdin; errors never echo the received bytes. */
+export function readProbeInput(input = process.stdin, timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    if (input.isTTY) { reject(invalidAuthInput()); return; }
+    const chunks = [];
+    let size = 0;
+    const cleanup = () => {
+      clearTimeout(timer);
+      input.off('data', data).off('end', end).off('error', failed);
+      input.pause();
+      for (const chunk of chunks) chunk.fill(0);
+    };
+    const failed = () => { cleanup(); reject(invalidAuthInput()); };
+    const data = chunk => {
+      const bytes = Buffer.from(chunk);
+      size += bytes.length;
+      if (size > AUTH_INPUT_LIMIT) { bytes.fill(0); failed(); return; }
+      chunks.push(bytes);
+    };
+    const end = () => {
+      try { const value = parseProbeInput(Buffer.concat(chunks).toString('utf8')); cleanup(); resolve(value); }
+      catch { failed(); }
+    };
+    const timer = setTimeout(failed, timeoutMs);
+    input.on('data', data).once('end', end).once('error', failed);
+    input.resume();
+  });
+}
+
+function getJson(url, headers = {}, timeoutMs = 1500) {
   return new Promise((resolve) => {
-    const req = http.get(url, { timeout: timeoutMs }, (res) => {
-      let body = '';
-      res.setEncoding('utf8');
-      res.on('data', (d) => { body += d; if (body.length > 65536) req.destroy(); });
-      res.on('end', () => { let json = null; try { json = JSON.parse(body); } catch { /* not ours */ } resolve({ status: res.statusCode, json }); });
+    const req = http.get(url, { headers, timeout: timeoutMs, agent: false }, (res) => {
+      const chunks = [];
+      let size = 0;
+      res.on('data', chunk => {
+        size += chunk.length;
+        if (size > 65536) { req.destroy(); resolve({ error: 'BODY_TOO_LARGE' }); }
+        else chunks.push(chunk);
+      });
+      res.on('error', () => resolve({ error: 'HTTP_ERROR' }));
+      res.on('end', () => {
+        let json = null;
+        try { json = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { /* not ours */ }
+        resolve({ status: res.statusCode, json });
+      });
     });
     req.on('timeout', () => { req.destroy(); resolve({ error: 'timeout' }); });
-    req.on('error', (e) => resolve({ error: e.code || e.message }));
+    req.on('error', (e) => resolve({ error: e.code || 'HTTP_ERROR' }));
   });
 }
 
@@ -136,10 +205,17 @@ function canListen(port, host) {
   });
 }
 
-/** 'ours' (our server answers /healthz), 'free', 'busy' (another program) or 'denied'. */
-export async function probePort(port, host = '::') {
-  const r = await getJson(`http://127.0.0.1:${port}/healthz`);
-  if (r.json && r.json.ok === true && 'uptimeSec' in r.json) return { state: 'ours', health: r.json };
+/** 'ours' requires a full report; strict stdin-auth mode never accepts a free port or anonymous readiness. */
+export async function probePort(port, host = '::', auth = null) {
+  if (auth !== null) {
+    if (host !== '127.0.0.1' || !Number.isInteger(port) || port < 1 || port > 65535) throw invalidAuthInput();
+    auth = parseProbeInput(JSON.stringify(auth));
+  }
+  // Literal loopback only, no proxy, redirects, URL/Host or credential destination from stdin.
+  const r = await getJson(`http://127.0.0.1:${port}/healthz`, auth ? { Cookie: auth.cookie } : {});
+  const ours = auth ? r.status === 200 && isFullHealth(r.json) : r.json && r.json.ok === true && 'uptimeSec' in r.json;
+  if (ours) return { state: 'ours', health: r.json };
+  if (auth) return { state: 'unverified', http: r.status, code: r.error || 'FULL_HEALTH_REQUIRED' };
   let l = await canListen(port, host);
   // The same three errors startServer treats as "this host has no IPv6": don't report the port busy for that.
   if (!l.ok && host === '::' && ['EAFNOSUPPORT', 'EADDRNOTAVAIL', 'EINVAL'].includes(l.code)) l = await canListen(port, '0.0.0.0');
@@ -195,22 +271,35 @@ function tool(cmd, args) {
 // ---------------------------------------------------------------------------------------------------
 
 function parseArgs(argv) {
-  const o = { port: Number(process.env.PORT) || 3000, host: process.env.HOST || '::', help: false };
+  const authStdin = argv.includes('--auth-stdin');
+  const o = { port: authStdin ? 0 : Number(process.env.PORT) || 3000,
+    host: authStdin ? '127.0.0.1' : process.env.HOST || '::', help: false, authStdin };
   for (let i = 0; i < argv.length; i++) {
     const [k, v] = argv[i].split('=');
     const val = () => (v !== undefined ? v : argv[++i]);
     if (k === '--port') o.port = Number(val()) || o.port;
     else if (k === '--host') o.host = val() || o.host;
+    else if (argv[i] === '--auth-stdin') continue;
     else if (k === '-h' || k === '--help') o.help = true;
     else throw new Error(`unknown option ${argv[i]}`);
   }
   return o;
 }
 
-async function main() {
+export async function main(argv = process.argv.slice(2), input = process.stdin) {
   let opts;
-  try { opts = parseArgs(process.argv.slice(2)); } catch (e) { console.error(e.message); return 2; }
-  if (opts.help) { console.log('node tools/doctor.mjs [--port 3000] [--host ::]  — 只读诊断，不修改任何文件'); return 0; }
+  try { opts = parseArgs(argv); } catch (e) { console.error(e.message); return 2; }
+  if (opts.help) { console.log('node tools/doctor.mjs [--port 3000] [--host ::] [--auth-stdin]  — 只读诊断，不修改任何文件'); return 0; }
+  if (opts.authStdin) {
+    try {
+      if (opts.host !== '127.0.0.1' || !Number.isInteger(opts.port) || opts.port < 1 || opts.port > 65535) throw invalidAuthInput();
+      const auth = await readProbeInput(input);
+      const result = await probePort(opts.port, opts.host, auth);
+      if (result.state !== 'ours') { console.error('doctor: authenticated full /healthz probe failed'); return 1; }
+      console.log(`doctor: authenticated full /healthz verified on 127.0.0.1:${opts.port}`);
+      return 0;
+    } catch { console.error('doctor: invalid or failed --auth-stdin probe'); return 1; }
+  }
   const rows = [];
   let bad = false;
   const row = (state, label, detail = '') => { rows.push([state, label, detail]); if (state === 'err') bad = true; };

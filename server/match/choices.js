@@ -122,6 +122,12 @@ function formatCount(gd) {
   return gd.isSolo ? solo : multi;
 }
 
+/** 返回该模式该轮原配置的候选数量，供个人补牌及审计共同使用，不按参与人数放大。 */
+export function draftCardCount(gd, round) {
+  const sch = scheduleFor(gd, round);
+  return Number.isInteger(sch.cards) && sch.cards > 0 ? Math.min(sch.cards, 6) : formatCount(gd);
+}
+
 function eligibleItems(gd, lo, hi) {
   const out = [];
   for (let t = lo; t <= hi; t++) for (const id of gd.shopItemsByTier[t] || []) out.push(id);
@@ -133,16 +139,13 @@ function itemCard(gd, id) {
   return { kind: 'item', id, name: it ? it.name : id, desc: it ? it.desc || '' : '', tier: it && Number.isInteger(it.tier) ? it.tier : 1, price: 0 };
 }
 
-/**
- * Build the draft cards for an SP round.
- * @returns {{ family: string, name: string, desc: string, eventId: string|null, cards: object[] } | null}
- */
-export function generateDraft(gd, rng, round, { stageId = null, bondAvailable = null, itemAvailable = null } = {}) {
+/** 按轮次配置生成原数量机变候选；可指定补牌家族与合法战术筛选器，无合法卡时返回空，不扣库存。 */
+export function generateDraft(gd, rng, round, { stageId = null, bondAvailable = null, itemAvailable = null, family: requestedFamily = null, tacticAvailable = null } = {}) {
   const sch = scheduleFor(gd, round);
   const fams = Array.isArray(sch.families) && sch.families.length ? sch.families.map((f) => [f.family, f.weight]) : [['supply', 1]];
-  let family = weightedPick(rng, fams) || 'supply';
-  const n = Number.isInteger(sch.cards) && sch.cards > 0 ? Math.min(sch.cards, 6) : formatCount(gd);
-  const opts = { stageId, bondAvailable, round, itemAvailable };
+  let family = requestedFamily ?? (weightedPick(rng, fams) || 'supply');
+  const n = draftCardCount(gd, round);
+  const opts = { stageId, bondAvailable, round, itemAvailable, tacticAvailable };
   let cards = buildCards(gd, rng, family, n, sch, opts);
   if (!cards.length && family !== 'supply') { family = 'supply'; cards = buildCards(gd, rng, family, n, sch, opts); }
   if (!cards.length) return null;
@@ -346,7 +349,9 @@ export function shopDraftCards(gd, rng, n, round = null, itemAvailable = null) {
     const kinds = Object.entries(slot).filter(([k]) => k === 'coin' ? !!coin : Number.isInteger(Number(k)));
     const kind = weightedPick(rng, kinds);
     if (kind == null) continue;
-    const list = kind === 'coin' ? [coin] : ofTier(Number(kind));
+    // 盟约之币也占有限库存；该固定槽无货时使用原补给候选，不能凭空复制受限装备。
+    const coins = kind === 'coin' ? free([coin]) : [];
+    const list = kind === 'coin' ? (coins.length ? coins : ofTier(6)) : ofTier(Number(kind));
     const id = weightedPick(rng, list.map((x) => [x, Object.hasOwn(w, x) ? w[x] : 1]));
     if (id) out.push(itemCard(gd, id));
   }
@@ -365,14 +370,14 @@ export function tacticCard(c) {
  * Terrain cards only for the match stage; a card whose every target bond is dead in this match (mode-inactive, or no
  * chess left in the pool: `bondAvailable`) is never offered.
  */
-export function tacticDraftCards(gd, rng, n, { stageId = null, bondAvailable = null, round = null } = {}) {
+export function tacticDraftCards(gd, rng, n, { stageId = null, bondAvailable = null, round = null, tacticAvailable = null } = {}) {
   const bondOk = (c) => {
     if (typeof bondAvailable !== 'function') return true;
     const bonds = cardTargetBonds(gd, c.effectId);
     return !bonds || bonds.some((b) => !!bondAvailable(b));
   };
   const list = Array.isArray(gd.choices.cards && gd.choices.cards.tactic) ? gd.choices.cards.tactic : [];
-  const pool = list.filter((c) => c && (c.kind !== 'terrain' || (stageId && c.stageId === stageId)) && gd.effect(c.effectId) && bondOk(c));
+  const pool = list.filter((c) => c && (c.kind !== 'terrain' || (stageId && c.stageId === stageId)) && gd.effect(c.effectId) && bondOk(c) && (!tacticAvailable || tacticAvailable(c)));
   const spec = gd.choices.tacticDraft && typeof gd.choices.tacticDraft === 'object' ? gd.choices.tacticDraft : null;
   const official = !!spec && (!Array.isArray(spec.rounds) || spec.rounds.includes(round));
   const kinds = official && Array.isArray(spec.kinds) && spec.kinds.length ? spec.kinds : null;
@@ -384,7 +389,7 @@ export function tacticDraftCards(gd, rng, n, { stageId = null, bondAvailable = n
   return out;
 }
 
-function buildCards(gd, rng, family, n, sch, { stageId = null, bondAvailable = null, round = 1, itemAvailable = null } = {}) {
+function buildCards(gd, rng, family, n, sch, { stageId = null, bondAvailable = null, round = 1, itemAvailable = null, tacticAvailable = null } = {}) {
   if (family === 'bounty') return bountyDraftCards(gd, rng, n, sch, round);
   if (family === 'shop') {
     const cards = shopDraftCards(gd, rng, n, round, itemAvailable);
@@ -402,8 +407,16 @@ function buildCards(gd, rng, family, n, sch, { stageId = null, bondAvailable = n
     for (let i = 0; i < n && list.length; i++) out.push(itemCard(gd, list[Math.floor(rng() * list.length)]));
     return out;
   }
-  if (family === 'tactic') return tacticDraftCards(gd, rng, n, { stageId, bondAvailable, round });
+  if (family === 'tactic') return tacticDraftCards(gd, rng, n, { stageId, bondAvailable, round, tacticAvailable });
   return [];
+}
+
+/** 判断原战术是否仅发资金或免费刷新；用于个人库存全空时保留原数值的合法选择，不生成新奖励。 */
+export function stockIndependentTactic(gd, card) {
+  const buffs = gd.effect(card.effectId)?.buffs;
+  return card.kind === 'ally' && Array.isArray(buffs) && buffs.length > 0 && buffs.every((b) =>
+    ['global_special_choice_gain_coin', 'global_special_choice_refresh_free'].includes(b.key)
+    && Number.isInteger(b.bb?.count) && b.bb.count > 0);
 }
 
 /** Public card view. */
@@ -433,6 +446,7 @@ export function applyCard(m, ps, card) {
   }
 }
 
+/** 将未被注册处理器接管的卡片效果应用到指定接收者；随机奖励扣接收者库存并修改其经济或效果状态。 */
 function applyDefault(m, ps, card) {
   const gd = m.gd;
   if (card.kind === 'bounty') {
@@ -457,7 +471,7 @@ function applyDefault(m, ps, card) {
       case 'global_special_choice_gain_equip': {
         const gain = Math.min(PLUGIN_GAIN_COUNT_MAX, count);
         for (let i = 0; i < gain; i++) {
-          const id = m.rollItemId({ pool: bs.pool });
+          const id = m.rollItemId({ pool: bs.pool, player: ps });
           if (id) ps.acquireItem(id, { source: 'choice' });
         }
         handled = true;
@@ -493,8 +507,8 @@ function applyDefault(m, ps, card) {
         const gain = Math.min(PLUGIN_GAIN_COUNT_MAX, count);
         for (let i = 0; i < gain; i++) {
           const extra = typeof ps.diyStockEntries === 'function' ? ps.diyStockEntries() : null;
-          const id = m.pool.roll(m.rngMeta, { maxTier: Math.max(1, ps.shop.level), filter: hasBond, extra })
-            || m.pool.roll(m.rngMeta, { maxTier: 6, filter: hasBond, extra });
+          const id = ps.chessPool.roll(m.rngMeta, { maxTier: Math.max(1, ps.shop.level), filter: hasBond, extra })
+            || ps.chessPool.roll(m.rngMeta, { maxTier: 6, filter: hasBond, extra });
           if (id) ps.acquireChess(id, { source: 'choice' });
         }
         handled = true;

@@ -1,0 +1,11 @@
+# 本机调试只覆盖应用监听和 Origin；不启动公网反代，也不关闭认证。
+services:
+  app:
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      SP_AUTH_ORIGIN: http://127.0.0.1:3000
+      SP_AUTH_ALLOW_HTTP: "1"
+      TRUST_PROXY: "0"
+  proxy:
+    profiles: [public]

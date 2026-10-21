@@ -76,7 +76,7 @@ export default [
     rules,
   },
   {
-    files: ['public/js/**/*.js', 'public/studio/**/*.js'],
+    files: ['public/js/**/*.js', 'public/studio/**/*.js', 'public/auth/**/*.js'],
     languageOptions: {
       ecmaVersion: 2024,
       sourceType: 'module',

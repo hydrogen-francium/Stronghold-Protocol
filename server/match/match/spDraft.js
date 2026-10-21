@@ -5,7 +5,8 @@
 // Installed on Match.prototype by server/match/Match.js (a method container: never instantiated; `this` is the match).
 
 import { PHASE, ERR } from '../../../shared/constants.js';
-import { generateDraft, applyCard, bountyBattles, isMultiRoundBounty, bountyCard } from '../choices.js';
+import { generateDraft, applyCard, bountyBattles, isMultiRoundBounty, bountyCard, stockIndependentTactic, draftCardCount, cardTargetBonds } from '../choices.js';
+import { createRng, deriveSeed } from '../../sim/rng.js';
 import { onPickCard } from '../botEmotes.js';
 import { weightedPick } from '../waves.js';
 import { botPickCard } from '../bot.js';
@@ -14,10 +15,20 @@ import { OK, fail, DELAYS } from './common.js';
 /** Cards of the personal choice (PRTS 卫戍协议：盟约 下半 §法术 教鞭: "于3个战术特训的悬赏任务中选择一项"). */
 const PERSONAL_OFFER_SIZE = 3;
 
+/** 对局机变、个人教鞭与随机奖励方法；随机库存必须遵守冻结的共享或个人作用域。 */
 export class MatchSpDraft {
+  /** 按实际规则返回随机奖励使用的库存；个人规则必须显式指定本局玩家，避免跨账号扣账。 */
+  rollStocks(player) {
+    if (!this.runtimeContext.personalPools) return { chess: this.pool, items: this.itemPool };
+    if (!player || this.players.get(player.playerId) !== player) throw new TypeError("个人库存抽取必须指定本局玩家");
+    return { chess: player.chessPool, items: player.itemPool };
+  }
+
+  /** 创建机变轮选；扩展局为每名存活玩家生成独立私有牌面，四人以内保留原随机流与共享牌面。 */
   enterSpDraft() {
-    const draft = generateDraft(this.gd, this.rngDraft, this.round, { stageId: this.stageId, bondAvailable: (bondId) => this.bondLive(bondId), itemAvailable: id => this.itemPool.canGain(id) });
     const alive = this.alivePlayers();
+    const personal = this.runtimeContext.personalPools;
+    const draft = personal ? {} : generateDraft(this.gd, this.rngDraft, this.round, { stageId: this.stageId, bondAvailable: (bondId) => this.bondLive(bondId), itemAvailable: id => alive.some((ps) => ps.itemPool.canGain(id)) });
     if (!draft || !alive.length) { this.beforePrepOffers(); return; }
     this.phase = PHASE.SP_DRAFT;
     let order = alive.map((p) => p.playerId);
@@ -27,9 +38,69 @@ export class MatchSpDraft {
     // untimed: solo and any single-human match (soloUntimed); the co-op order / 6 cards stay
     const untimed = this.soloUntimed;
     this.sp = { ...draft, order, idx: 0, picks: {}, taken: {}, untimed, turnDeadline: 0 };
+    if (personal) {
+      this.sp.personal = true;
+      this.sp.instance = ++this._spSeq;
+      this.sp.decks = new Map();
+      // 每人的牌面随机流不受其他玩家生成、补牌或超时消耗影响。
+      for (const ps of alive) {
+        const rng = createRng(deriveSeed(this.seed, `sp:${this.battlePrefix}:${this.round}:${ps.playerId}`));
+        this.sp.decks.set(ps.playerId, { rng, revision: 0, ...this.personalSpDraft(ps, rng) });
+        this.reviseSpDeck(ps);
+      }
+    }
     this.setDeadline(0);
     this.startSpTurn();
     this.markPublic();
+  }
+
+  /** 按接收者库存生成原家族牌面；原补给也无货时仅使用数据中无库存依赖的原战术，奖励数值不变。 */
+  personalSpDraft(ps, rng, family = null) {
+    const opts = { stageId: this.stageId, bondAvailable: (id) => this.spBondAvailable(ps, id), itemAvailable: (id) => ps.itemPool.canGain(id), family };
+    const draft = generateDraft(this.gd, rng, this.round, opts);
+    const count = draftCardCount(this.gd, this.round);
+    if (draft?.cards.length === count) return draft;
+    // 自定义悬赏表不足原数量时也不能缩短个人牌面，先沿用原补给回退再考虑无库存战术。
+    const supply = generateDraft(this.gd, rng, this.round, { ...opts, family: 'supply' });
+    if (supply?.cards.length === count) return supply;
+    const fallback = generateDraft(this.gd, rng, this.round, { ...opts, family: 'tactic', tacticAvailable: (c) => stockIndependentTactic(this.gd, c) });
+    if (!fallback) throw new TypeError('个人机变无合法候选：内容不满足开局预检契约');
+    return fallback;
+  }
+
+  /** 个人机变的羁绊候选必须在该接收者普通或自选库存中有剩余，不借用队友的可用副本。 */
+  spBondAvailable(ps, bondId) {
+    if (this.gd.modeInactiveBonds.has(bondId)) return false;
+    return [...ps.chessPool.entries, ...(ps.diyStockEntries() ?? [])].some(([id, entry]) =>
+      entry.left > 0 && ps.gd.chess(id)?.bonds?.includes(bondId));
+  }
+
+  /** 更新个人牌面修订号并推送所有者私有状态，使迟到请求无法领取被替换的卡。 */
+  reviseSpDeck(ps) {
+    const deck = this.sp.decks.get(ps.playerId);
+    deck.id = `${this.battlePrefix}.sp.${this.round}.${this.sp.instance}.${ps.seat}.${++deck.revision}`;
+    this.markPrivate(ps);
+  }
+
+  /** 返回指定玩家的原始候选；未指定玩家时读取当前轮选者，不将个人牌面暴露给公共视图。 */
+  spCards(ps = this.players.get(this.spTurn())) {
+    return this.sp?.personal ? this.sp.decks.get(ps?.playerId)?.cards ?? [] : this.sp?.cards ?? [];
+  }
+
+  /** 库存被团队奖励改变时仅替换失效项；原家族无货才整副改为原补给或无库存依赖战术，并刷新实例标识。 */
+  refreshSpDeck(ps) {
+    if (!this.sp.personal) return false;
+    const deck = this.sp.decks.get(ps.playerId);
+    const invalid = deck.cards.filter((c) => !this.spCardAvailable(c, ps));
+    if (!invalid.length) return false;
+    const replacement = this.personalSpDraft(ps, deck.rng, deck.family);
+    if (replacement.family !== deck.family) Object.assign(deck, replacement);
+    else {
+      // 装备家族允许放回抽样，保留仍合法的卡及其索引，避免无关选项随补牌跳变。
+      for (const card of invalid) deck.cards[card.idx] = { ...replacement.cards[card.idx % replacement.cards.length], idx: card.idx };
+    }
+    this.reviseSpDeck(ps);
+    return true;
   }
 
   spTurn() {
@@ -38,19 +109,29 @@ export class MatchSpDraft {
     return s.order[s.idx] ?? null;
   }
 
-  spCardAvailable(card) { return !!card && this.sp?.taken[card.idx] == null && (card.kind !== 'item' || this.itemPool.canGain(card.id)); }
+  /** 校验当前回合卡片是否仍可领取；装备始终复核领取者库存，不预留展示卡。 */
+  spCardAvailable(card, ps = this.players.get(this.spTurn())) {
+    if (!card || !ps || (!this.sp?.personal && this.sp?.taken[card.idx] != null)) return false;
+    if (card.kind === 'item') return ps.itemPool.canGain(card.id);
+    const bonds = this.sp?.personal && card.kind === 'tactic' ? cardTargetBonds(this.gd, card.id) : null;
+    return !bonds || bonds.some((id) => this.spBondAvailable(ps, id));
+  }
 
+  /** 推进共享轮选至尚未领取的存活玩家；名单耗尽后进入下一阶段。 */
   startSpTurn() {
     const s = this.sp;
     this.cancel(this._turnTimer);
     this._turnTimer = null;
-    while (s.idx < s.order.length) { // loop-cap: draft order
+    // 只向前扫描有限的轮选名单，退出或淘汰的玩家不再占用回合。
+    while (s.idx < s.order.length) {
       const ps = this.players.get(s.order[s.idx]);
       if (ps && ps.alive && s.picks[ps.playerId] == null) break;
       s.idx++;
     }
-    const available = s.cards.filter(c => this.spCardAvailable(c)).map(c => c.idx);
-    if (s.idx >= s.order.length || !available.length) { this.setDeadline(0); this.later(0, () => this.finishSpDraft()); return; }
+    if (s.idx >= s.order.length) { this.setDeadline(0); this.later(0, () => this.finishSpDraft()); return; }
+    this.refreshSpDeck(this.players.get(this.spTurn()));
+    const available = this.spCards().filter(c => this.spCardAvailable(c)).map(c => c.idx);
+    if (!available.length) { this.setDeadline(0); this.later(0, () => this.finishSpDraft()); return; }
     const token = ++this._turnToken;
     if (!s.untimed) {
       const first = s.idx === 0;
@@ -59,9 +140,11 @@ export class MatchSpDraft {
         if (this.phase !== PHASE.SP_DRAFT || token !== this._turnToken) return;
         const ps = this.players.get(this.spTurn());
         if (!ps) return;
-        const avail = s.cards.filter(c => this.spCardAvailable(c)).map(c => c.idx);
+        this.refreshSpDeck(ps);
+        const avail = this.spCards(ps).filter(c => this.spCardAvailable(c, ps)).map(c => c.idx);
         if (!avail.length) { this.finishSpDraft(); return; }
-        this._applyCard(ps, avail[Math.floor(this.rngDraft() * avail.length)]);
+        const rng = s.personal ? s.decks.get(ps.playerId).rng : this.rngDraft;
+        this._applyCard(ps, avail[Math.floor(rng() * avail.length)]);
       });
       s.turnDeadline = this.deadline;
     } else {
@@ -78,30 +161,40 @@ export class MatchSpDraft {
       if (this.phase !== PHASE.SP_DRAFT || token !== this._turnToken || !this.sp) return;
       const ps = this.players.get(this.spTurn());
       if (!ps || !ps.botControlled) return;
-      const avail = this.sp.cards.filter(c => this.spCardAvailable(c)).map(c => c.idx);
+      this.refreshSpDeck(ps);
+      const cards = this.spCards(ps);
+      const avail = cards.filter(c => this.spCardAvailable(c, ps)).map(c => c.idx);
       if (!avail.length) return;
-      this._applyCard(ps, botPickCard(this, ps, this.sp.cards, avail));
+      this._applyCard(ps, botPickCard(this, ps, cards, avail));
     });
   }
 
-  pickCard(ps, idx) {
+  /** 校验轮次、所有者、候选索引和个人修订号后领取；重复或过期请求不发奖。 */
+  pickCard(ps, idx, choiceId) {
     if (this.phase !== PHASE.SP_DRAFT || !this.sp) return fail(ERR.WRONG_PHASE);
     if (!ps.alive) return fail(ERR.ELIMINATED);
     if (this.sp.picks[ps.playerId] != null) return fail(ERR.ALREADY);
     if (this.spTurn() !== ps.playerId) return fail(ERR.NOT_YOUR_TURN);
-    if (!Number.isInteger(idx) || idx < 0 || idx >= this.sp.cards.length) return fail(ERR.BAD_TARGET);
-    if (!this.spCardAvailable(this.sp.cards[idx])) return fail(ERR.SOLD_OUT);
+    if (this.sp.personal) {
+      if (choiceId !== this.sp.decks.get(ps.playerId).id) return fail(ERR.BAD_TARGET);
+      if (this.refreshSpDeck(ps)) return fail(ERR.BAD_TARGET);
+    }
+    const cards = this.spCards(ps);
+    if (!Number.isInteger(idx) || idx < 0 || idx >= cards.length) return fail(ERR.BAD_TARGET);
+    if (!this.spCardAvailable(cards[idx], ps)) return fail(ERR.SOLD_OUT);
     this._applyCard(ps, idx);
     return OK;
   }
 
+  /** 将一名玩家的一次选择应用到原效果分发器；团队战术仍逐目标应用一次，不重复遍历持有人。 */
   _applyCard(ps, idx) {
     const s = this.sp;
-    if (!s || s.picks[ps.playerId] != null || !this.spCardAvailable(s.cards[idx])) return;
-    const card = s.cards[idx];
+    const cards = this.spCards(ps);
+    if (!s || s.picks[ps.playerId] != null || !this.spCardAvailable(cards[idx], ps)) return;
+    const card = cards[idx];
     if (!card) return;
     s.picks[ps.playerId] = idx;
-    s.taken[idx] = ps.playerId;
+    if (!s.personal) s.taken[idx] = ps.playerId;
     try { applyCard(this, ps, card); } catch (e) { this.reportError(`applyCard ${card.id}`, e); }
     this.markPrivate(ps);
     this.markPublic();
@@ -186,11 +279,13 @@ export class MatchSpDraft {
    * `also` (pool_equip_kathe: 突变细胞) joins the draw even though it is shopExcluded. The shop item slot does not
    * read it. `pick` still drops ids that `canGain` refuses, so an empty shop item stays out and an uncapped `also`
    * id can still be drawn. `exclude` removes ids before sampling (Cathy's match-long allowance / distinct choices). */
-  rollItemId({ pool = null, tier = null, maxTier = 6, shopLevel = 6, exclude = [] } = {}) {
+  /** 按池配置、等级和排除项抽装备编号，不扣库存；个人规则必须传领取玩家，无货返回空。 */
+  rollItemId({ pool = null, tier = null, maxTier = 6, shopLevel = 6, exclude = [], player = null } = {}) {
+    const stock = this.rollStocks(player).items;
     const pools = this.gd.choices.pools && typeof this.gd.choices.pools === 'object' ? this.gd.choices.pools : {};
     const p = typeof pool === 'string' && Object.hasOwn(pools, pool) ? pools[pool] : null;
     const rng = this.rngMeta;
-    const pick = (ids, weights = null) => this.itemPool.pick(rng, ids.filter((id) => !exclude.includes(id)), weights);
+    const pick = (ids, weights = null) => stock.pick(rng, ids.filter((id) => !exclude.includes(id)), weights);
     const tierList = (lo, hi) => { const out = []; for (let t = lo; t <= hi; t++) for (const id of this.gd.shopItemsByTier[t] || []) out.push(id); return out; };
     const also = p && Array.isArray(p.also) ? p.also.filter((id) => typeof id === 'string' && this.gd.item(id)) : [];
     const withAlso = (list) => {
@@ -200,7 +295,7 @@ export class MatchSpDraft {
     };
     if (p && p.kind === 'equip') {
       if (Array.isArray(p.weighted) && p.weighted.length) {
-        const pairs = p.weighted.filter((x) => Array.isArray(x) && this.gd.item(x[0]) && this.itemPool.canGain(x[0]));
+        const pairs = p.weighted.filter((x) => Array.isArray(x) && this.gd.item(x[0]) && stock.canGain(x[0]));
         for (const id of also) if (!pairs.some((x) => x[0] === id)) pairs.push([id, 1]);
         return pick(pairs.map(x => x[0]), new Map(pairs));
       }
@@ -225,13 +320,15 @@ export class MatchSpDraft {
    * bonds (the player's data view: a slotted slot's operator) — 0.2.0 WE2.
    * @returns {{ kind: 'item'|'chess', id: string, golden?: boolean } | null}
    */
-  rollPool(poolId, { shopLevel = 6, extra = null, chessOf = null, exclude = [] } = {}) {
+  /** 从指定奖励池抽取干员或装备，结合领取者库存与自选条目返回结果，不在展示时扣账。 */
+  rollPool(poolId, { shopLevel = 6, extra = null, chessOf = null, exclude = [], player = null } = {}) {
+    const stock = this.rollStocks(player).chess;
     const pools = this.gd.choices.pools && typeof this.gd.choices.pools === 'object' ? this.gd.choices.pools : {};
     const p = typeof poolId === 'string' && Object.hasOwn(pools, poolId) ? pools[poolId] : null;
     if (!p || typeof p !== 'object') return null;
     const lvl = Math.max(1, Math.min(6, Number.isInteger(shopLevel) ? shopLevel : 6));
     if (p.kind === 'equip') {
-      const id = this.rollItemId({ pool: poolId, shopLevel: lvl, exclude });
+      const id = this.rollItemId({ pool: poolId, shopLevel: lvl, exclude, player });
       return id ? { kind: 'item', id } : null;
     }
     if (p.kind !== 'chess') return null;
@@ -239,7 +336,7 @@ export class MatchSpDraft {
     const free = (id) => {
       if (typeof id !== 'string' || !this.gd.chess(id)) return false;
       const base = this.gd.baseIdOf(id);
-      return !this.pool.has(base) || this.pool.left(base) > 0;
+      return !stock.has(base) || stock.left(base) > 0;
     };
     let id = null;
     if (Array.isArray(p.weighted) && p.weighted.length) {
@@ -253,7 +350,7 @@ export class MatchSpDraft {
       const minTier = Number.isInteger(p.minTier) ? p.minTier : 1;
       const bond = typeof p.bond === 'string' ? p.bond : null;
       const recOf = typeof chessOf === 'function' ? chessOf : (cid) => this.gd.chess(cid);
-      id = this.pool.roll(rng, {
+      id = stock.roll(rng, {
         tier: Number.isInteger(p.tier) ? p.tier : null,
         maxTier,
         filter: (cid, e) => e.tier >= minTier && (!bond || (Array.isArray(recOf(cid)?.bonds) && recOf(cid).bonds.includes(bond))),

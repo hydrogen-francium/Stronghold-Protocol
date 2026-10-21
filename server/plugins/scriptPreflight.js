@@ -1,6 +1,7 @@
 // Synchronous C1 registration preflight (DESIGN §32.10); no author imports in the lobby.
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { childEnvironment } from '../auth/child-env.js';
 import { canonicalJson } from '../../shared/plugins/identity.js';
 import { nodeSha256 } from './identity.js';
 import { sandboxProcessOptions } from '../match/host/childHost.js';
@@ -26,7 +27,7 @@ export function preflightScripts(registry, scripts, hashInput) {
     const key = canonicalJson([script.id,script.hash,part.files['@script'],nodeSha256(canonicalJson(settings))]);
     let report = cache.get(key);
     if (!report) {
-      const { execArgv = [], ...processOptions } = script.execution === 'sandbox' ? sandboxProcessOptions(128) : {};
+      const { execArgv = [], ...processOptions } = script.execution === 'sandbox' ? sandboxProcessOptions(128) : { env: childEnvironment() };
       const probe = spawnSync(process.execPath,[...execArgv,fileURLToPath(new URL('./scriptProbe.js',import.meta.url))],{
         ...processOptions,
         input:JSON.stringify({scripts:[script],hashInput:{plugins:[part],settings:{[script.id]:settings}}}),

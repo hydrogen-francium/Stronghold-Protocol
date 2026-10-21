@@ -69,6 +69,7 @@ export class MatchViews {
     return f ? f.fieldId : null;
   }
 
+  /** 构造可广播的对局快照；共享机变的售罄标记按当前领取者的库存计算，不修改状态。 */
   publicView() {
     const v = {
       t: 'm.public',
@@ -79,6 +80,7 @@ export class MatchViews {
       serverNow: this.sched.now(),
       modeId: this.modeId,
       difficulty: this.difficulty,
+      runtimeContext: this.runtimeContext,
       stageId: this.stageId,
       setupRevision: this.setupRevision,
       rerollVote: this.setupVote ? {
@@ -152,9 +154,12 @@ export class MatchViews {
     }
     if (this.phase === PHASE.SP_DRAFT && this.sp) {
       const s = this.sp;
-      v.sp = {
+      // 个人候选及所选索引只在所有者私有视图中；公开状态仅用于轮选进度和倒计时。
+      v.sp = s.personal ? {
+        personal: true, round: this.round, instance: s.instance, order: s.order.slice(), turn: this.spTurn(), completed: Object.keys(s.picks), untimed: !!s.untimed,
+      } : {
         family: s.family, name: s.name, desc: s.desc, eventId: s.eventId,
-        cards: s.cards.map(c => ({ ...cardView(c), soldOut: c.kind === 'item' && !this.itemPool.canGain(c.id) })), order: s.order.slice(),
+        cards: s.cards.map(c => ({ ...cardView(c), soldOut: c.kind === 'item' && !this.players.get(this.spTurn())?.itemPool.canGain(c.id) })), order: s.order.slice(),
         turn: this.spTurn(), picks: { ...s.picks }, taken: { ...s.taken }, untimed: !!s.untimed,
       };
     }
@@ -274,9 +279,7 @@ export class MatchViews {
     return p ? { charId: p.charId, skillIndex: p.skillIndex, uniEquipId: p.uniEquipId } : undefined;
   }
 
-  /** The 外勤医疗 reserve medic already standing on each player's field in preparation. Touch replaces it only at
-   * battleStart, so the prep view always uses the reserve medic, regardless of the current elite count. The stage's
-   * normal-board slot is transformed to the correct half of a boss field by _onBossHalf / the client prep camera. */
+  /** 返回整备阶段的预备医疗展示；逐持有人保留唯一编号和来源，位置仍由原关卡及半场映射决定。 */
   prepMapChars(ps) {
     if (!ps?.alive || this.phase !== PHASE.PREP || !this.teamMedicGranted()) return [];
     const id = 'char_605_cmedic';
@@ -285,12 +288,15 @@ export class MatchViews {
     const rec = this.gd.token(id);
     if (!slot || !rec) return [];
     const dir = slot.dir || 'RIGHT';
-    return [{
-      id: -ps.seat - 1, uid: -ps.seat - 1, kind: 'token', side: 'ally', ownerId: ps.playerId, defId: id,
+    const sources = this.teamMedicSources() ?? [null];
+    return sources.map((source, index) => ({
+      id: -index * this.order.length - ps.seat - 1, uid: -index * this.order.length - ps.seat - 1,
+      kind: 'token', side: 'ally', ownerId: ps.playerId, defId: id,
+      ...(source ? { bandSource: { ...source } } : {}),
       area: 'board', name: rec.name || id, tier: 1, golden: false,
       spine: rec.assets?.spine || id, avatar: rec.assets?.avatar || id,
       x: slot.pos[1], y: slot.pos[0], dir, facing: dir === 'LEFT' ? -1 : 1, maxHp: rec.stats?.maxHp || 1,
-    }];
+    }));
   }
 
   /** UnitInfo of a player's board pieces on their (board) tiles — a prep scout's board, the boss partner's (bossMateView).

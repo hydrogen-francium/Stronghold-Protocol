@@ -5,6 +5,49 @@ the **UI owner** consuming `m.public` / `m.private` / `m.result`, and anyone dri
 Normative contracts stay in DESIGN.md §6 and §8 ([design/match.md](design/match.md),
 [design/network.md](design/network.md)); this file documents the implementation and every assumption it makes.
 
+**Fork boundary:** production authentication and the central participating-account ledger are specified separately in
+[AUTH.md](AUTH.md), not attributed to upstream 0.3.1 or to the deterministic match rules. Fork protocol version 2
+supports co-op capacity 4/8/16, default 4, with `MAX_SEATS = 16`. Accounts persist in private SQLite; Match, room,
+game Session and Admission state do not survive a restart. Durable accounts do not add cloud history, achievements
+or cross-device preference sync.
+
+**Frozen runtime roster:** `Match.runtimeContext` / `opts.runtimeContext` is the validated, immutable
+`{version:1, capacity, participantCount, personalPools}` snapshot of actual occupied seats at start. Humans plus
+explicit AI count; empty/spectator seats do not, and sparse seat indexes remain unchanged. `personalPools` is N>4,
+not capacity>4, and does not change after departures/elimination. Legacy callers omitting context derive the smallest
+legal capacity fitting both count and highest occupied seat (minimum 4, including solo). Explicit malformed context
+fails closed before host creation and again on IPC receipt. Public/reconnect views and test journals/replay carry it
+separately from content hashes and plugin `rules`.
+
+**Fork inventory scope (2026-10-21):** `ps.chessPool` / `ps.itemPool` bind each player to the applicable ordinary
+inventory. N≤4 shares the original `m.pool` / `m.itemPool` objects; N>4 owns one original co-op-sized pool per player,
+with no count multiplier, and the match-level shared aliases are null. DIY stock remains separate via `ps.poolOf`.
+Shop rolls, rewards, effect rolls/grants, upgrades, debt repayment, elimination and AI inventory reads use the
+recipient scope. Extended `rollItemId` / `rollPool` calls require the owning player; effect contexts supply it and
+cannot override it. Opening rerolls prepare all ordinary pools before commit and retain equipment pools/debt.
+Invariants check each actual pool separately, identifying its owners instead of allowing cross-player cancellation.
+**Fork personal SP and repeated bands (2026-10-21):** N>4 keeps the original sequential draft timing but gives each
+player an original-sized private deck and independently derived random stream. Current instance/revision `choiceId`
+is required to claim; stale/replayed claims cannot grant rewards. Public state exposes order/turn/completion only.
+Stock-invalid cards refill within the same family, then original supplies, then existing stock-independent funds or
+free-refresh tactics; custom content lacking a legal final tactic fails preflight rather than skipping a player.
+Repeated starting bands are allowed only under the frozen personal rule. Duck replacements run once per holder;
+team medical grants retain explicit sources and distinct same-position device instances without extending maps.
+Personal effects remain recipient-scoped; N≤4 retains the original exclusivity and shared SP lifecycle.
+
+**Fork battle accounting (2026-10-21):** boss HP uses actual alive participants without the former four-player cap.
+Field sizes and at-most-two unite helpers stay unchanged; unite progress supports 15 actual enemy sources. Full
+accounting that exceeds structural limits or the 60 KiB UTF-8 envelope budget sends `b.resultFallback`, reusing the
+server headless job/pacer with one task per field and the existing simulation/time bounds. Only per-unit display
+statistics may be dropped to fit; leaks, unspawned entries and their mods are never discarded for settlement.
+The server settles its full raw result, not a truncated compact report. See [design/network.md](design/network.md).
+**Fork client records/layouts (2026-10-21):** local statistics retain all 16 player rows through migration,
+import/export, replay and compaction. An explicit missing self stays unknown and is excluded from personal totals.
+Opening/settlement retain sparse high seats; expanded teammate and settlement lists scroll and ready pips wrap.
+See [design/client.md](design/client.md). Compose/asset initialization and draining are implemented; real container cold start,
+16-human browser acceptance and deployment performance remain unverified ([COMPOSE.md](COMPOSE.md)). Shared rules below
+describe N≤4 unless this fork boundary explicitly states otherwise.
+
 ```
 server/match/
   Match.js         state machine, timers, round loop, co-op orchestration, views (the lobby⇄match interface is at the top)
@@ -175,17 +218,24 @@ otherwise every "之后 / 后续的每场作战" card — e.g. 教鞭's 法术�
 A `choice:<effectId>` registry handler overrides the default application (§2.4).
 
 ### 1.3 Disconnects, AI takeover
-* Local multi-window recovery (#431, DESIGN §28.27) sends optional `hello.noReplace` for a tentative shared token,
-  and `hello.claimAt` for a previously welcomed token. Before binding a different socket, the server rejects a
-  connected seat when no replacement was allowed or the request has a later stamp than the attached holder
-  (`SESSION_IN_USE`). Equal stamps still allow normal reload/reconnect. These hints do not authenticate players
-  and do not change the bearer token or expiration rules below.
+* **Authenticated fork recovery:** account identity comes from the cookie-authenticated WebSocket upgrade, never the
+  nickname, IP or a supplied account field. A reconnect token must belong to that account; explicit empty, unknown,
+  expired or foreign tokens return `INVALID_RECONNECT`, without guest creation or touching a foreign holder. A
+  tokenless hello finds only the account's own retained Session. Ordinary browser recovery sends `noReplace:true`;
+  only a dedicated `takeover:true` action with replacement permitted can replace a live holder. `noReplace` always
+  wins, while an explicit takeover may override `claimAt`. Rejected tokens are retained until explicit recovery.
+* **Legacy null-auth components only:** local multi-window recovery (#431, DESIGN §28.27) still understands
+  `noReplace` / `claimAt`; same-stamp replacement and old bearer-token arbitration are compatibility behavior, not
+  the production fork's authentication or takeover policy. Fresh original-connection guards are retained through
+  queued execution and asynchronous replies in authenticated production (AUTH.md §5).
 * Disconnected human: the seat keeps playing its last lineup; drafts auto-resolve at their deadlines, prep auto-readies at
   the deadline (an open 教鞭 choice is picked at random first, §2.5; then the temp pieces due at that prep are sold/destroyed). Nothing is bought for them. A battle the human was authority of goes to the server
-  (normal / 联防: re-simulated from t = 0) or, on a boss field, to the partner's replica (DESIGN §14). The session stays
-  resumable for 10 min (net.js `reconnectWindowMs`); a **solo** run's for the official `constants.singleReconnectTime`
-  (86 400 s = 24 h, lobby.js `soloResumeWindowMs`) — nothing in a solo run is timed, so it simply waits. `onReconnect`
-  resends `m.public`, `m.private` and the `b.start` of the field the player is on / watching.
+  (normal / 联防: re-simulated from t = 0) or, on a boss field, to the partner's replica (DESIGN §14). In the
+  authenticated fork the Session and active-human Admission reservation stay retained for **10 minutes, including
+  solo** (net.js `reconnectWindowMs`). Untimed solo phases do not imply a 24-hour retained seat. Only a legacy
+  null-auth Lobby applies `constants.singleReconnectTime` (86 400 s; option `soloReconnectWindowMs`, helper
+  `soloResumeWindowMs()`). `onReconnect` resends
+  `m.public`, `m.private` and the `b.start` of the field the player is on / watching.
 * `g.autoplay { on }` ("AI 托管"): the bot plays the seat (drafts, buying, placement, an open 教鞭 choice, ready) until turned off.
 * `onLeave` (quit / reconnect window expired): 中途退出 counts as elimination (research 00-INDEX §3, 01 §9, 06 §7 /
   §10.3): every copy the seat holds returns to the shared pool at once; the seat leaves the round loop and the Final
@@ -195,6 +245,34 @@ A `choice:<effectId>` registry handler overrides the default application (§2.4)
   becomes the default band, a 机变 turn passes on and an open 教鞭 choice goes with the seat (`eliminate`). Status `left`, LP 0, rounds passed = the rounds it had survived.
   When no human is left at all the match ends immediately (`reason: 'abandoned'`); when only eliminated spectators are
   left it ends as `'eliminated'`.
+
+#### Fork Admission ownership (outside Match and the deterministic sim)
+
+Production `server/index.js` creates one central synchronous Admission and passes it to Lobby. Before constructing /
+starting the match, Lobby validates the actual participating non-left roster and its complete human
+`playerId → accountId` map, then atomically reserves the unique accounts plus the actual AI roster. Duplicate account
+bindings are refused, not deduplicated. Humans have one global limit of 16 across rooms; AI seats a separate default
+budget of 16 (`SP_BOT_LIMIT`). Login, lobby waiting, spectators, sockets, IPs and room capacity are different counts.
+`SERVER_FULL` means a budget is full; `ACCOUNT_BUSY` means an account is already reserved elsewhere. Existing
+per-address/resource gates remain additional limits. Four-seat rooms/protocol 1 are unchanged.
+
+The original Lobby match context retains the frozen start roster, account mapping and opaque Symbol lease. Match
+receives gameplay seats, not the account mapping, auth services or Admission lease; those do not enter Match options,
+plugin APIs or IPC. A failed start rolls back that captured attempt; later host failure ends and
+cleans its original match context (no new startup-ack protocol is implied). Disconnect, auth rejection/logout,
+elimination with retained presence and AI 托管 do not release or reclassify a human reservation. If the match ends
+during the ten-minute grace, whole-match cleanup releases it then.
+
+For quit/expiry, permanent departure must first be confirmed by the real Match `onLeave`: local synchronous void
+completion is success, an error/throw/missing hook or local thenable is not. Hosted `MatchProxy.onLeave` is an
+ID-bearing request awaiting `{ok:true}`, not a fire-and-forget disconnect notification. Missing hooks, rejected /
+timed-out requests or invalid/error replies keep the reservation and conservatively retain membership for retry or
+resync. An authenticated permanent departure never falls back to `onDisconnect`.
+
+Release uses the captured account mapping and original lease, even when expiry already removed the old Session.
+Confirmed per-account release, startup rollback, match end/dispose, room destruction and shutdown are idempotent and
+stale-safe; an old reply cannot mutate/release a later match. The gameplay effects of `onLeave` above occur in Match;
+the global account ledger remains outside it. Only one authoritative app instance is supported (AUTH.md §6).
 
 ### 1.3a Solo pause
 `g.pause { on }` (`Match.setPause`, DESIGN §14 Solo pause): solo matches only (co-op → `WRONG_PHASE`), `on: true` only

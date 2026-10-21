@@ -2,7 +2,7 @@
 
 import { N_ } from './i18n.js';
 
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 /** Release version shown to players (title screen, server banner, /healthz). Kept equal to package.json "version"
  * (test/version.test.js); PROTOCOL_VERSION above is the separate wire-format number. */
 export const APP_VERSION = '0.3.1';
@@ -18,7 +18,10 @@ export const DEV_BUILD = /-dev$/.test(APP_VERSION);
  */
 export const PLUGIN_API = Object.freeze({ current: 2, min: 1 });
 
-export const MAX_SEATS = 4;
+/** Fork room capacities; actual occupied players, not capacity, select the >4-player rules. */
+export const DEFAULT_SEATS = 4;
+export const MAX_SEATS = 16;
+export const ROOM_CAPACITIES = Object.freeze([4, 8, 16]);
 /**
  * Spectator seats of a co-op room (community report #26, owner's decision 2026-10-04) — a remake feature: the official
  * room has 1–4 players and no spectator seat (there only eliminated players and 联防 bystanders watch, research 09 §3.1).
@@ -136,6 +139,11 @@ export const ANIM = Object.freeze({ IDLE: 0, MOVE: 1, ATTACK: 2, SKILL: 3, DIE: 
 export const ERR = Object.freeze({
   BAD_MSG: 'BAD_MSG',             // malformed / unknown message
   SESSION_IN_USE: 'SESSION_IN_USE', // a local recovery candidate cannot replace the connected holder
+  AUTH_REQUIRED: 'AUTH_REQUIRED',
+  INVALID_RECONNECT: 'INVALID_RECONNECT',
+  SERVER_FULL: 'SERVER_FULL',
+  MAINTENANCE: 'MAINTENANCE',
+  ACCOUNT_BUSY: 'ACCOUNT_BUSY',
   RATE: 'RATE',                   // rate limited
   NOT_IN_ROOM: 'NOT_IN_ROOM',
   ROOM_NOT_FOUND: 'ROOM_NOT_FOUND',
@@ -188,6 +196,11 @@ export const ERR = Object.freeze({
 });
 
 export const ERR_TEXT = {
+  AUTH_REQUIRED: N_('登录已失效，请重新通过准入并登录'),
+  INVALID_RECONNECT: N_('无法恢复此对局，请确认账号并手动重试'),
+  SERVER_FULL: N_('全服参战名额已满，请稍后再试'),
+  MAINTENANCE: N_('服务器即将维护，暂停开启新的模拟'),
+  ACCOUNT_BUSY: N_('此账号已在另一场模拟中参战'),
   SESSION_IN_USE: N_('此对局仍在其他窗口中，或当前浏览器无法安全恢复。请关闭原窗口后重试。'),
   BAD_MSG: N_('无效的请求'), RATE: N_('操作过于频繁'), NOT_IN_ROOM: N_('你不在房间中'), ROOM_NOT_FOUND: N_('未找到该同盟密钥对应的房间'),
   ROOM_FULL: N_('房间已满'), ROOM_STARTED: N_('模拟已开始'), NOT_HOST: N_('只有房主可以操作'), NOT_READY: N_('仍有玩家未就绪'),

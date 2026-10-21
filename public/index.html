@@ -15,20 +15,15 @@
   <meta name="apple-mobile-web-app-title" content="卫戍协议" />
   <meta name="description" content="卫戍协议：盟约 · 网页联机复刻（非官方同人作品）" />
   <title>卫戍协议：盟约 · STRONGHOLD PROTOCOL</title>
-  <link rel="manifest" href="/manifest.json" />
+  <link rel="manifest" href="/manifest.json" crossorigin="use-credentials" />
   <link rel="icon" href="/icons/favicon.ico" sizes="16x16 32x32 48x48" />
   <link rel="icon" href="/icons/favicon-16.png" type="image/png" sizes="16x16" />
   <link rel="icon" href="/icons/favicon-32.png" type="image/png" sizes="32x32" />
   <link rel="icon" href="/icons/app.svg" type="image/svg+xml" sizes="any" />
   <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" sizes="180x180" />
 
-  <!-- Web fonts: never render-blocking (LAN/offline play must still start); system fallbacks in theme.css. -->
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link rel="stylesheet" media="print" data-web-fonts
-        href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700;900&family=Oxanium:wght@400;500;600;700&family=Rajdhani:wght@500;600;700&display=swap" />
-  <script src="/js/webFonts.js" defer></script>
-  <!-- Self-hosted Bender / Novecento (provided by the assets pipeline). -->
+  <!-- Default pages use self-hosted Bender / Novecento and the system CJK fallbacks in theme.css.
+       Optional remote stylesheets must not introduce third-party font requests into the authenticated game. -->
   <link rel="stylesheet" href="/fonts/fonts.css" />
 
   <link rel="stylesheet" href="/css/theme.css" />

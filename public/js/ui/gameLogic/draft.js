@@ -37,14 +37,18 @@ export function normalizeDraft(draft, players = []) {
   return { order, turnPid, picks, skipsLeft, done };
 }
 
-/**
- * Normalise m.public.sp ({family, cards, turn, picks, order?}).
- * Cards: string ids or objects; picks: {playerId: cardIdx} | [{playerId, idx}] | card.takenBy.
- * @param {any} sp
- * @param {any[]} [players]
- */
-export function normalizeSp(sp, players = []) {
+/** 将公共轮选进度与本人同轮私有牌面合并为界面模型；不从他人私有状态或旧轮次恢复候选，无副作用。 */
+export function normalizeSp(sp, players = [], priv = null, myId = null) {
   if (!isObj(sp)) return null;
+  if (sp.personal) {
+    const own = priv?.playerId === myId && priv.sp?.round === sp.round && priv.sp?.instance === sp.instance ? priv.sp : null;
+    const view = normalizeSp({ ...sp, personal: false, ...own, picks: {}, taken: {} }, players);
+    view.id = own?.id ?? null;
+    view.personal = true;
+    view.pickOf = new Map((sp.completed ?? []).map((pid) => [pid, 0]));
+    view.pickedCount = view.pickOf.size;
+    return view;
+  }
   const ids = (Array.isArray(players) ? players : []).filter(isObj).map((p) => p.playerId);
   const order = Array.isArray(sp.order) && sp.order.length ? sp.order.filter((x) => typeof x === 'string') : ids;
   const cards = (Array.isArray(sp.cards) ? sp.cards : []).slice(0, 6).map((c, idx) => {

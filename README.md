@@ -1,6 +1,8 @@
 # 卫戍协议：盟约 · Stronghold Protocol: Alliance
 
-《明日方舟》季节性自走棋塔防玩法「卫戍协议：盟约」的**非官方同人复刻**：浏览器即开即玩，单人或 1–4 人联机合作。
+《明日方舟》季节性自走棋塔防玩法「卫戍协议：盟约」的**非官方同人复刻**：浏览器即开即玩。本 fork 提供账号认证、4/8/16 人容量及超过四人的个人池扩展。
+
+> **部署本 fork：优先阅读 [Compose 部署与维护](docs/COMPOSE.md)。** 根目录 `compose.yaml` 会先从固定上游完整包下载并校验素材，再启动应用和 HTTPS 反代。游戏素材不提交到 Git；不需要将本机素材目录上传或修改服务器源码。需配置域名、邮箱和两份秘密文件。下方整合包与部分 1–4 人说明保留上游背景，不替代本 fork 的认证及部署契约。
 
 ![version](https://img.shields.io/badge/version-0.3.1-2ea44f)
 ![license](https://img.shields.io/badge/code%20license-GPL--3.0--or--later-blue)

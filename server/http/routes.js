@@ -21,6 +21,7 @@ import { PROTOCOL_VERSION, APP_VERSION } from '../../shared/constants.js';
 import { buildTag } from './buildTag.js';
 import { setSecurityHeaders, sendError, sendJson, splitUrl } from './common.js';
 import { clientAddress, isLocalIp } from '../net.js';
+import { privateResponse } from './auth.js';
 
 const MAX_URL_LENGTH = 4096;
 
@@ -81,12 +82,31 @@ const wantsTraffic = (query) => /(?:^|&)traffic(?:=(?:1|true|yes))?(?:&|$)/i.tes
  *   plugin studio (server/studio/index.js), or none
  * @returns {(req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => void}
  */
-export function createRequestHandler({ serveStatic, health, log, trustProxy = 'auto', studio = null, csp = null, trustedRuntime = null }) {
+export function createRequestHandler({ serveStatic, health, log, trustProxy = 'auto', studio = null, csp = null, trustedRuntime = null, auth = null, authShell = null }) {
   async function handleRequest(req, res) {
     const url = req.url || '/';
     if (url.length > MAX_URL_LENGTH) { sendError(req, res, 414, '请求地址过长 · URI too long'); return; }
     const parts = splitUrl(url);
     if (!parts) { sendError(req, res, 400, '请求地址无效 · Bad request'); return; }
+    if (auth) {
+      if (authShell && await authShell(req, res, parts.rawPath)) return;
+      if (await auth.handle(req, res, parts.rawPath)) return;
+      const identity = auth.identity(req);
+      if (!identity) {
+        // Readiness leaks no room/account/content data. Authenticated clients retain buildGuard's report.
+        if (parts.rawPath === '/healthz' && (req.method === 'GET' || req.method === 'HEAD')) {
+          sendJson(req, res, 200, { ok: !auth.closed });
+          return;
+        }
+        if (['/', '/index.html'].includes(parts.rawPath) && (req.method === 'GET' || req.method === 'HEAD')) {
+          res.writeHead(303, { Location: '/auth/', 'Cache-Control': 'no-store' });
+          res.end();
+          return;
+        }
+        sendJson(req, res, 401, { error: 'AUTH_REQUIRED' });
+        return;
+      }
+    }
     if (trustedRuntime && parts.rawPath.startsWith('/x/') && await trustedRuntime.route(req,res,parts.rawPath)) return;
     if (studio && studio.handles(parts.rawPath)) { await studio.handle(req, res, parts.rawPath, parts.query); return; }
     if (req.method !== 'GET' && req.method !== 'HEAD') {
@@ -103,6 +123,7 @@ export function createRequestHandler({ serveStatic, health, log, trustProxy = 'a
   }
 
   return (req, res) => {
+    if (auth) privateResponse(res);
     setSecurityHeaders(res);
     if (csp) res.setHeader('Content-Security-Policy', csp);
     if (health.traffic) health.traffic.meter(res, splitUrl(req.url || '/')?.rawPath || '/');

@@ -32,11 +32,13 @@
 // Per-network limits for internet clients (see net.js clientAddress; local/LAN peers are exempt): open sockets
 // (maxConnectionsPerAddr, refused at upgrade with 429), rooms and running matches (lobby.js).
 //
-// Programmatic use (tests): `const srv = await startServer({ port: 0, quiet: true }); … await srv.close();`
+// Programmatic use: supply validated authEnv (synthetic private state in tests), then await srv.close().
 // The server only auto-listens when this file is the process entry point.
 
 import http from 'node:http';
 import path from 'node:path';
+import { assetBundleFrom } from './http/assetBundle.js';
+import { drainCheckFrom } from './http/drain.js';
 import { getData, loadData } from './data.js';
 import { ROOT, listenAddress, bindCandidates, serveDirs, makeLogger, parseTrustProxy, assetIndexOptionsFrom } from './http/config.js';
 import { WS_MAX_PAYLOAD, createSessionStack, attachWebSocket } from './http/websocket.js';
@@ -60,6 +62,14 @@ import { createAssetIndex } from './http/assetIndex.js';
 import { createManifestViews } from './http/assetViews.js';
 import { answerClientError } from './http/common.js';
 import { lanUrls, displayHost, isProcessEntry, runMain } from './http/boot.js';
+import { clientAddress } from './net.js';
+import { authConfigFrom } from './auth/config.js';
+import { AuthStore } from './auth/store.js';
+import { Passwords } from './auth/passwords.js';
+import { AuthService } from './auth/service.js';
+import { Admission } from './auth/admission.js';
+import { createAuthShell } from './http/auth.js';
+import { studioMode } from './studio/gate.js';
 
 // The public API of this module (tests and tools import it from here); the code lives in ./http/.
 export {
@@ -68,27 +78,27 @@ export {
 };
 
 /**
- * Build and start the HTTP + WebSocket server.
+ * 构建并启动认证、房间、静态资源与实时服务；启动失败关闭已取得的资源。
  * @param {{
  *   port?: number, host?: string, quiet?: boolean, log?: object,
- *   publicDir?: string, dataDir?: string, sharedDir?: string, packsDir?: string, pluginsDir?: string,
+ *   publicDir?: string, dataDir?: string, sharedDir?: string, packsDir?: string, pluginsDir?: string, assetBundleDir?: string, drainFile?: string,
  *   MatchClass?: Function, seedFn?: () => number,
  *   lobbyGraceMs?: number, reconnectWindowMs?: number, heartbeatMs?: number, helloTimeoutMs?: number,
- *   ratePerSec?: number, rateBurst?: number, maxConnections?: number, maxRooms?: number,
+ *   ratePerSec?: number, rateBurst?: number, maxConnections?: number, maxSessions?: number, maxRooms?: number,
  *   maxConnectionsPerAddr?: number, maxRoomsPerAddr?: number, maxMatchesPerAddr?: number, resyncMinGapMs?: number,
  *   heavyPerSec?: number, heavyBurst?: number, trustProxy?: 'auto' | boolean, soloReconnectWindowMs?: number,
  *   assetIndex?: boolean | { cacheFile?: string | null, delayMs?: number }, studio?: boolean,
- *   matchHost?: object,
+ *   matchHost?: object, authEnv?: Record<string, string | undefined>,
  * }} [opts]
  *   assetIndex: the content-hash index (default on; false or SP_ASSET_INDEX=0: off — config.js assetIndexOptionsFrom);
- *   studio: the plugin studio at /studio/ (default on for this machine and the local network — SP_STUDIO=local|off;
- *   false: none);
+ *   studio: the plugin studio at /studio/ (fork default off; true or SP_STUDIO=lan|local enables the original
+ *   address/Host/owner-key gates; false: none). authEnv supplies deployment settings, never an auth bypass;
  *   matchHost: options of the match hosts (server/match/host/index.js — watchdogMs, matchOptions …; tests)
  * @returns {Promise<{ port: number, host: string, url: string, server: http.Server, wss: import('ws').WebSocketServer,
  *                     lobby: import('./lobby.js').Lobby, network: import('./net.js').Network,
  *                     registry: import('./net.js').SessionRegistry, packs: ReturnType<typeof createPluginRegistry>,
  *                     content: import('./plugins/identity.js').VanillaContent, visual: ReturnType<typeof createVisualSets>,
- *                     contents: ReturnType<typeof createContentSets>, hosts: ReturnType<typeof createMatchHosts>,
+ *                     contents: ReturnType<typeof createContentSets>, hosts: ReturnType<typeof createMatchHosts>, admission: Admission,
  *                     traffic: ReturnType<typeof createTrafficCounter>, assetIndex: ReturnType<typeof createAssetIndex> | null,
  *                     views: ReturnType<typeof createManifestViews> | null, studio: ReturnType<typeof createStudio> | null,
  *                     close: () => Promise<void> }>}
@@ -97,58 +107,123 @@ export async function startServer(opts = {}) {
   const { port, host } = listenAddress(opts);
   const log = opts.log || makeLogger(!!opts.quiet);
   const { publicDir, dataDir, sharedDir, packsDir, pluginsDir } = serveDirs(opts);
+  const bundle = assetBundleFrom(opts.assetBundleDir ?? process.env.SP_ASSET_BUNDLE_DIR);
+  const assetPublicDir = bundle?.publicDir ?? publicDir;
+  const assetDataDir = bundle?.dataDir ?? dataDir;
   const simDir = path.join(ROOT, 'server', 'sim');
+  // Fork deployment: there is no unauthenticated production mode. Programmatic tests
+  // provide synthetic settings through authEnv, subject to the same validation.
+  const config = authConfigFrom(opts.authEnv ?? process.env, {
+    root: ROOT, publicDirs: [publicDir, dataDir, sharedDir, simDir, packsDir, pluginsDir, assetPublicDir, assetDataDir],
+  });
+  const isDraining = drainCheckFrom(opts.drainFile ?? process.env.SP_DRAIN_FILE, config.stateDir);
+  const trustProxy = opts.trustProxy ?? parseTrustProxy(process.env.TRUST_PROXY);
+  let store, passwords, auth, admission, registry, lobby, network, hosts;
+  let assetIndex, studio, trustedRuntime, server, wss;
+  let closing = null;
 
-  // The process-wide singleton serves the default data dir; a custom dir (tests) gets its own copy.
-  const data = opts.dataDir ? loadData(dataDir, { log }) : getData({ dir: dataDir, log });
-  // the vanilla content hash `cs` (DESIGN §32): the bytes of the served sim, shared code and game data, read once now —
-  // like the data the matches use and the build tag below
-  const content = computeVanillaContent({ simDir, sharedDir, dataDir, shim: DATA_SHIM_JS, log });
-  log.info(`[content] vanilla ${content.cs.slice(0, 16)} (${Object.keys(content.simFiles).length} code files, ${Object.keys(content.data).length} data files)`);
-  // language packs and plugins (docs/PACKS.md, docs/PLUGINS.md): scanned now — the start log names them — and again
-  // whenever their folders change
-  const scriptMode = process.env.SP_PLUGIN_SCRIPTS;
-  const packs = createPluginRegistry({ publicDir, dataDir, packsDir, pluginsDir }, { log, scriptHost:host, scriptMode });
-  packs.refresh(true);
-  // the content hashes of the art (built in the background once listening) and the manifests served with them
-  const indexOptions = assetIndexOptionsFrom(opts, publicDir);
-  const assetIndex = indexOptions ? createAssetIndex({ publicDir, log, ...indexOptions }) : null;
-  const views = createManifestViews({ dataDir, index: assetIndex, log });
-  // the visual sets of the cosmetic plugins (DESIGN §32 P1a): what a room's host switches on, served at /vs/ and /p/
-  const visual = createVisualSets({ registry: packs, log });
-  // the server owner's policy (plugins/config.json), the content sets of the gameplay plugins (served at /cs/<cs16>/…),
-  // what a room's plugins make of both, and the match hosts a room with gameplay plugins plays in (DESIGN §32.6)
-  const policy = createPluginPolicy({ pluginsDir, log });
-  const contents = createContentSets({ registry: packs, vanillaData: data, log, maxSets: () => policy.get().maxSets });
-  const roomSets = createRoomSets({ registry: packs, visual, contents, policy });
-  // a child process per content set; SP_MATCH_HOST=worker asks for a worker thread instead (match/host/index.js header:
-  // an out-of-memory abort in a worker thread ends the whole server)
-  const transport = String(process.env.SP_MATCH_HOST || '').trim().toLowerCase() === 'worker' ? 'worker' : 'process';
-  const hosts = createMatchHosts({ contents, log, options: { transport, maxWorkers: Math.max(1, policy.get().maxSets), ...(opts.matchHost || {}) } });
-  const { registry, lobby, network } = createSessionStack(opts, { data, log, content, plugins: roomSets, hosts });
-  const serveStatic = createStaticHandler({ publicDir, dataDir, sharedDir, simDir, packsDir, pluginsDir, packs, content, log, assetIndex, views, visual, contents });
-  // the plugin studio (DESIGN §32.9): its page and API for this machine and the local network; it watches plugins/ only
-  // once it is used (hot reload), and rooms whose host is the author or alone follow a plugin's changes by themselves
-  const studio = opts.studio === false ? null : createStudio({ publicDir, pluginsDir, dataDir, registry: packs, lobby, sessions: registry, log, fetch: opts.fetch });
-  const trustedRuntime = await createTrustedRuntime({registry:packs,log});
-  lobby.trustedRuntime = trustedRuntime;
-  const startedAt = Date.now();
-  // The tag is per process (see buildTag): read the browser runtime once, here, not on every /healthz.
-  resetBuildTag();
-  buildTag();
+  // Used for both partial startup and normal shutdown. Mark auth closed first, so
+  // in-flight/queued work fails closed while sockets and match hosts are drained.
+  function close() {
+    if (closing) return closing;
+    closing = (async () => {
+      const pending = [], errors = [];
+      const failed = (label, error) => {
+        errors.push(error);
+        log.error(`[shutdown] ${label}`, error?.code || 'CLOSE_FAILED');
+      };
+      const stop = (label, action) => {
+        try { pending.push(Promise.resolve(action()).catch(e => failed(label, e))); }
+        catch (e) { failed(label, e); }
+      };
+      if (auth) stop('auth', () => auth.close());
+      else {
+        if (passwords) stop('passwords', () => passwords.close());
+        if (store) stop('auth store', () => store.close());
+      }
+      if (lobby) stop('lobby', () => lobby.shutdown('shutdown'));
+      if (network) stop('network', () => network.close());
+      if (hosts) stop('match hosts', () => hosts.close());
+      if (assetIndex) stop('asset index', () => assetIndex.close());
+      if (studio) stop('studio', () => studio.close());
+      if (trustedRuntime) stop('trusted runtime', () => trustedRuntime.close());
+      if (wss) stop('websocket', () => new Promise((resolve, reject) => {
+        wss.close(error => error ? reject(error) : resolve());
+      }));
+      if (server) stop('http', () => new Promise((resolve, reject) => {
+        const timer = setTimeout(() => { server.closeAllConnections?.(); }, 500);
+        timer.unref?.();
+        const done = (error) => {
+          clearTimeout(timer);
+          if (error && error.code !== 'ERR_SERVER_NOT_RUNNING') reject(error);
+          else resolve();
+        };
+        try {
+          server.close(done);
+          server.closeIdleConnections?.();
+        } catch (e) { done(e); }
+      }));
+      await Promise.all(pending);
+      if (errors.length) throw new AggregateError(errors, 'Server cleanup failed');
+    })();
+    return closing;
+  }
 
-  const traffic = createTrafficCounter();
-  const server = http.createServer(createRequestHandler({ serveStatic, csp: process.env.SP_CSP === 'off' ? null : siteCsp(publicDir), health: { startedAt, network, registry, lobby, content, traffic, assetIndex, views, trusted:trustedRuntime?.health }, log, trustProxy: network.opts.trustProxy, studio, trustedRuntime }));
-  server.on('clientError', answerClientError);
-  const wss = attachWebSocket(server, { network, log, traffic });
-
-  // The address actually bound. The default may fall back to IPv4; the returned host and url follow that.
-  let boundHost;
   try {
-    // A host with IPv6 switched off refuses '::'. Fall back to IPv4 rather than not booting. Only the default is
-    // retried: an explicit HOST is literal (server/http/config.js bindCandidates).
-    let bound = null;
-    let lastError = null;
+    store = new AuthStore(config.store);
+    passwords = new Passwords();
+    auth = new AuthService({
+      ...config.service, store, passwords,
+      addressKey: req => {
+        const address = clientAddress(req, trustProxy);
+        return address.key || address.ip;
+      },
+      onRevoke: (accountId, tokenHash) => network?.revoke(accountId, tokenHash),
+    });
+    // The only active-seat ledger in this app instance. Never send its lease tokens
+    // or the account/session service into Match options, plugins, or IPC.
+    admission = new Admission(config.admission);
+
+    // The process-wide singleton serves the default data dir; a custom dir (tests) gets its own copy.
+    const data = opts.dataDir ? loadData(dataDir, { log }) : getData({ dir: dataDir, log });
+    const content = computeVanillaContent({ simDir, sharedDir, dataDir, shim: DATA_SHIM_JS, log });
+    log.info(`[content] vanilla ${content.cs.slice(0, 16)} (${Object.keys(content.simFiles).length} code files, ${Object.keys(content.data).length} data files)`);
+    const scriptMode = process.env.SP_PLUGIN_SCRIPTS;
+    const packs = createPluginRegistry({ publicDir, dataDir, assetDataDir, packsDir, pluginsDir }, { log, scriptHost: host, scriptMode });
+    packs.refresh(true);
+    const indexOptions = assetIndexOptionsFrom(opts, publicDir);
+    assetIndex = indexOptions ? createAssetIndex({ publicDir: assetPublicDir, log, ...indexOptions }) : null;
+    const views = createManifestViews({ dataDir: assetDataDir, index: assetIndex, log });
+    const visual = createVisualSets({ registry: packs, log });
+    const policy = createPluginPolicy({ pluginsDir, log });
+    const contents = createContentSets({ registry: packs, vanillaData: data, log, maxSets: () => policy.get().maxSets });
+    const roomSets = createRoomSets({ registry: packs, visual, contents, policy });
+    const transport = String(process.env.SP_MATCH_HOST || '').trim().toLowerCase() === 'worker' ? 'worker' : 'process';
+    hosts = createMatchHosts({ contents, log, options: { transport, maxWorkers: Math.max(1, policy.get().maxSets), ...(opts.matchHost || {}) } });
+    ({ registry, lobby, network } = createSessionStack(opts, { data, log, content, plugins: roomSets, hosts, auth, admission, isDraining }));
+    const serveStatic = createStaticHandler({ publicDir, dataDir, assetPublicDir, assetDataDir, sharedDir, simDir, packsDir, pluginsDir, packs, content, log, assetIndex, views, visual, contents });
+    // A persistent game login is not studio ownership. Explicit enabling still
+    // retains the original local/Host/owner-key gates; the public fork defaults off.
+    const studioEnabled = opts.studio === true || (opts.studio !== false &&
+      ['lan', 'local', 'loopback'].includes(String(process.env.SP_STUDIO ?? '').trim().toLowerCase()));
+    studio = studioEnabled ? createStudio({ publicDir, pluginsDir, dataDir, registry: packs, lobby, sessions: registry, log, fetch: opts.fetch, mode: studioMode() }) : null;
+    trustedRuntime = await createTrustedRuntime({ registry: packs, log });
+    lobby.trustedRuntime = trustedRuntime;
+    const startedAt = Date.now();
+    resetBuildTag();
+    buildTag();
+
+    const traffic = createTrafficCounter();
+    server = http.createServer(createRequestHandler({
+      serveStatic, csp: process.env.SP_CSP === 'off' ? null : siteCsp(publicDir),
+      health: { startedAt, network, registry, lobby, content, traffic, assetIndex, views, trusted: trustedRuntime?.health },
+      log, trustProxy: network.opts.trustProxy, studio, trustedRuntime,
+      auth, authShell: createAuthShell(publicDir),
+    }));
+    server.on('clientError', answerClientError);
+    wss = attachWebSocket(server, { network, log, traffic, auth });
+
+    let bound = null, lastError = null;
     const candidates = bindCandidates(host);
     for (let i = 0; i < candidates.length; i++) {
       const candidate = candidates[i];
@@ -170,7 +245,6 @@ export async function startServer(opts = {}) {
       }
     }
     if (bound === null) throw lastError;
-    boundHost = bound;
     // Check the kernel's address too: aliases/DNS and bind fallback cannot weaken the owner gate.
     const actual = server.address();
     const scriptHost = actual && typeof actual === 'object' ? actual.address : '';
@@ -182,41 +256,16 @@ export async function startServer(opts = {}) {
       lobby.trustedRuntime = null;
       await trustedRuntime?.close();
     }
-  } catch (e) {
-    network.close(); // stop heartbeat/sweep timers of the half-built server
-    assetIndex?.close();
-    studio?.close();
-    await trustedRuntime?.close();
-    throw e;
+    server.on('error', (e) => log.error('[http] server error', e));
+    assetIndex?.start();
+    const addr = server.address();
+    const actualPort = typeof addr === 'object' && addr ? addr.port : port;
+    const url = `http://${displayHost(bound)}:${actualPort}`;
+    return { port: actualPort, host: bound, url, server, wss, lobby, network, registry, packs, content, visual, contents, hosts, admission, traffic, assetIndex, views, studio, close };
+  } catch (error) {
+    try { await close(); } catch { /* preserve the original startup failure */ }
+    throw error;
   }
-  server.on('error', (e) => log.error('[http] server error', e));
-  assetIndex?.start();
-
-  const addr = server.address();
-  const actualPort = typeof addr === 'object' && addr ? addr.port : port;
-  const url = `http://${displayHost(boundHost)}:${actualPort}`;
-
-  let closing = null;
-  async function close() {
-    if (closing) return closing;
-    closing = (async () => {
-      try { lobby.shutdown('shutdown'); } catch (e) { log.error('[shutdown] lobby', e); }
-      try { hosts.close(); } catch (e) { log.error('[shutdown] match hosts', e); }
-      network.close();
-      assetIndex?.close();
-      studio?.close();
-      await trustedRuntime?.close();
-      await new Promise((resolve) => {
-        server.close(() => resolve());
-        server.closeIdleConnections?.();
-        setTimeout(() => { server.closeAllConnections?.(); }, 500).unref();
-      });
-      try { wss.close(); } catch { /* ignore */ }
-    })();
-    return closing;
-  }
-
-  return { port: actualPort, host: boundHost, url, server, wss, lobby, network, registry, packs, content, visual, contents, hosts, traffic, assetIndex, views, studio, close };
 }
 
 // `node server/index.js` / npm start: listen, print the banner, stop on SIGINT / SIGTERM (http/boot.js).

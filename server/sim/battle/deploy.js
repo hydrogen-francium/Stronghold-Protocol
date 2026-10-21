@@ -5,7 +5,7 @@
 
 import { COLS } from '../constants.js';
 import { unitInfo } from '../snapshot.js';
-import { fin } from './util.js';
+import { fin, shareMapCharTile } from './util.js';
 
 export class BattleDeploy {
   /**
@@ -23,7 +23,8 @@ export class BattleDeploy {
     }
     const k = R0 * COLS + C0;
     const occ = this._occ[k];
-    if (occ && occ !== u && occ.alive && occ.deployed) { this.log(`tile ${R0},${C0} occupied; ${u} not deployed`); return false; }
+    const sharedMapChar = occ?.alive && occ.deployed && shareMapCharTile(u, occ);
+    if (occ && occ !== u && occ.alive && occ.deployed && !sharedMapChar) { this.log(`tile ${R0},${C0} occupied; ${u} not deployed`); return false; }
     // "倒地干员所在地块视为可部署，但所有我方单位在此处的部署行为将被阻止" (PRTS 卫戍协议/帮助 §作战阶段 单位部署)
     if (this.downOn(R0, C0, u)) { this.log(`a knocked-out operator lies on ${R0},${C0}; ${u} not deployed`); return false; }
     const first = u.deploySeq === 0;
@@ -53,7 +54,8 @@ export class BattleDeploy {
     // 联防 reconstructs deployment/battle-start effects first, then restores HP/SP once in Battle.start.
     const restoreLater = this.kind === 'unite' && this._startDeploying;
     if (!restoreLater && cs && u.kind === 'op' && Number.isFinite(cs.hpPct) && cs.hpPct > 0) u.hp = u.s.maxHp * Math.min(1, cs.hpPct);
-    this._occ[k] = u;
+    // 同位置的医疗仍是独立单位；占位表只保留一个代表，不覆盖此前实例。
+    if (!sharedMapChar) this._occ[k] = u;
     this._refreshRange(u); // also rebuilds baseRangeKeys (initial range incl. permanent rangeExtend)
     if (!u.skill) this._setupUnit(u);
     u.skill.reset(restoreLater ? null : cs);
@@ -121,7 +123,11 @@ export class BattleDeploy {
     if (unit.side === 'ally') {
       this.releaseBlocked(unit);
       const k = unit.tileR * COLS + unit.tileC;
-      if (this._occ[k] === unit) this._occ[k] = null;
+      if (this._occ[k] === unit) {
+        // 代表撤退时交给仍存活的同格实例，不能使其他医疗丢失占位。
+        this._occ[k] = unit.mapCharSource ? this.allyUnits.find(u => u.alive && u.deployed
+          && u.tileR === unit.tileR && u.tileC === unit.tileC && shareMapCharTile(u, unit)) ?? null : null;
+      }
       // keep persistent buffs only
       const kept = [];
       for (const b of unit.buffs) {

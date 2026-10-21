@@ -7,7 +7,7 @@ import { normDir } from '../dir.js';
 import { SkillRuntime } from '../skills.js';
 import { unitInfo } from '../snapshot.js';
 import { normalizeToken } from '../simdata.js';
-import { fin } from './util.js';
+import { fin, shareMapCharTile } from './util.js';
 
 export class BattleSummons {
   /**
@@ -54,9 +54,11 @@ export class BattleSummons {
     }
     if (!Number.isInteger(row) || !Number.isInteger(col) || !this.grid.inRect(row, col)) return null;
     const occ = this._occ[row * COLS + col];
-    if (occ && occ.alive && !opts.force) return null;
+    const sharedMapChar = shareMapCharTile({ ownerId: pid, mapCharSource: opts.mapCharSource }, occ);
+    if (occ && occ.alive && !opts.force && !sharedMapChar) return null;
     const dir = opts.dir != null ? normDir(opts.dir) : opts.facing != null ? normDir(opts.facing) : ownerUnit ? ownerUnit.dir : ps ? ps.dir : 'RIGHT';
     const u = this._makeAlly(ps, def, 'token', row, col, { ownerUnit, dir });
+    if (opts.mapCharSource) u.mapCharSource = { ...opts.mapCharSource };
     if (opts.stats) for (const [k, v] of Object.entries(opts.stats)) if (Number.isFinite(v)) u.base[k] = v;
     this._setupUnit(u, opts.kit ?? null);
     if (opts.untargetable) this.addBuff(u, { key: 'trait:untargetable', flags: { untargetable: true }, persist: true, allowDead: true });

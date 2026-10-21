@@ -1050,6 +1050,7 @@ export async function createFieldView(host, options = {}) {
   }
 
   function enterPrepMode() {
+    clearBeams();
     mode = 'prep';
     held.clear();
     cancelReplay();
@@ -1517,6 +1518,7 @@ export async function createFieldView(host, options = {}) {
     consumedIds.clear();
     clearHl();
     renderT0Battle = null;
+    clearBeams();
     mode = 'battle';
     const rect = meta.rect ? normRect(meta.rect) : (meta.kind === 'boss' || meta.kind === 'hidden' ? { ...GEO.BOSS_RECT } : meta.kind === 'unite' ? { ...GEO.UNITE_RECT } : { ...GEO.NORMAL_RECT });
     // prep: true = a read-only scouting board (a teammate's lineup during prep): prep-style pieces, no bars
@@ -1720,7 +1722,12 @@ export async function createFieldView(host, options = {}) {
       case 'deploy': {
         gone.delete(e[1]);
         const v = battleView(e[1]);
-        if (v) { v.onDeploy?.(); if (v.info?.kind !== 'device' && !wiring.deploy(v)) fx.deploy(v); }
+        if (v) {
+          v.onDeploy?.();
+          const beam = queueBeam(v, now);
+          // Keep official deploy skills / talents; only the procedural opening flash is replaced.
+          if (v.info?.kind !== 'device' && !wiring.deploy(v) && !beam) fx.deploy(v);
+        }
         break;
       }
       case 'atk': {
@@ -1870,6 +1877,41 @@ export async function createFieldView(host, options = {}) {
     });
   }
   let renderT0Battle = null;   // game time of the first rendered battle frame (spawn puffs skip the initial wave)
+  // Only the opening of a real 联防 field beams allied units in; late observers / prep never replay it.
+  const beamQ = [];            // { v, id }; same real / studio dt as UnitView fades and procedural fx
+  const beamed = new Set();    // field ids: a skin rebuild or redeploy must not beam a unit twice
+  let beamSeq = 0;
+  const beamMotion = globalThis.matchMedia?.('(prefers-reduced-motion: reduce)');
+  function reduceBeamMotion() { return settings.reduceMotion === true || beamMotion?.matches === true; }
+  function clearBeams() {
+    for (const { v } of beamQ) { v._beamLeft = 0; v.fadeIn = 0; }
+    beamQ.length = 0; beamed.clear(); beamSeq = 0;
+  }
+  function queueBeam(v, renderT) {
+    if (!v || v.destroyed || v.alive === false || v.down || mode !== 'battle' || battleMeta?.kind !== 'unite' || battleMeta.prep || reduceBeamMotion()) return false;
+    if (v._beamLeft > 0) return true; // deploy event + first snapshot: one arrival
+    const info = v.info;
+    if (!Number.isFinite(renderT) || renderT < 0 || renderT > 2 || !info || info.side !== 'ally' || info.kind === 'device' || info.kind === 'item' || beamed.has(info.id)) return false;
+    beamed.add(info.id);
+    v._beamLeft = 0.35 + Math.min(beamSeq++, 10) * 0.16;
+    v.fadeIn = 0;
+    beamQ.push({ v, id: info.id });
+    return true;
+  }
+  function pumpBeams(dt) {
+    let w = 0;
+    for (const b of beamQ) {
+      const v = b.v;
+      const live = views.get(b.id) === v && !v.destroyed && v.alive !== false && !v.down;
+      if (live && !reduceBeamMotion()) {
+        v._beamLeft = Math.max(0, v._beamLeft - dt);
+        if (v._beamLeft > 0) { beamQ[w++] = b; continue; }
+        v.fadeIn = 0;
+        fx.deploy(v, { beam: true });
+      } else { v._beamLeft = 0; v.fadeIn = 0; } // cancel dead / replaced views or reduced motion
+    }
+    beamQ.length = w;
+  }
   let downSeq = 0;             // syncBattle pass counter: a view still marked down after a pass left the `down` list
   function syncBattle(renderT) {
     if (renderT0Battle == null) renderT0Battle = renderT;
@@ -1888,8 +1930,10 @@ export async function createFieldView(host, options = {}) {
       }
       if (!v) v = battleView(id) || createUnknown(id, s);
       if (!v) continue;
-      if (!v._seen) { v._seen = true; v.fadeIn = 0; }
+      const fresh = !v._seen;
+      if (fresh) { v._seen = true; v.fadeIn = 0; }
       syncView(v, s, renderT);
+      if (fresh) queueBeam(v, renderT);
     }
     // knocked-out operators waiting to redeploy (b.snap `down`, user playtest #4 item 9): their view stays on the
     // field knocked down under a redeploy ring (UnitView.setDown) — made on the spot for one already down when this
@@ -2035,6 +2079,7 @@ export async function createFieldView(host, options = {}) {
             if (opts.playbackTime) advanceEffectClock(ofx, gdt); else ofx.update(gdt);
           }
         }
+        if (beamQ.length) pumpBeams(dt);
       } else if (mode === 'prep') {
         for (const [key, pd] of pending) {
           if (now - pd.t > DROP_PENDING_MS) {
@@ -2252,6 +2297,7 @@ export async function createFieldView(host, options = {}) {
       if (!s || typeof s !== 'object') return;
       const q = settings.quality;
       if (typeof s.damageNumbers === 'boolean') settings.damageNumbers = s.damageNumbers;
+      if (typeof s.reduceMotion === 'boolean') settings.reduceMotion = s.reduceMotion;
       if (typeof s.officialDamageNumbers === 'boolean') settings.officialDamageNumbers = s.officialDamageNumbers;
       if (typeof s.ammoEnergyCount === 'boolean') settings.ammoEnergyCount = s.ammoEnergyCount; // the units read it every frame (ctx.settings)
       // 设置「显示其他玩家的皮肤」 (docs/SKINS.md): the views already up keep the appearance they were built on, so the
@@ -2278,6 +2324,7 @@ export async function createFieldView(host, options = {}) {
     destroy() {
       if (destroyed) return;
       destroyed = true;
+      clearBeams();
       try { ro?.disconnect(); } catch { /* ignore */ }
       try { offAssets?.(); } catch { /* ignore */ }
       globalThis.document?.removeEventListener?.('visibilitychange', onVisible);

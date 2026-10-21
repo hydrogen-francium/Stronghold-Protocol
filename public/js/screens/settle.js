@@ -19,6 +19,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from '../../ven
 import { html, Icon, DifficultyIcon, Spinner } from '../ui/components.js';
 import { useGameData, Img, Sprite, PlayerAvatar, BondGlyph, BandIcon } from '../ui/gameComponents.js';
 import { normalizeResult, diyRecordFor, cardStandIn, standInForText } from '../ui/gameLogic.js';
+import { settlementIntroSeats } from '../ui/gameLogic/result.js';
 import { data } from '../data.js';
 import { chessPortraitUrl, chessAvatarUrl, itemIconUrl, enemyIconUrl, titleIconUrl } from '../ui/assetUrls.js';
 import { store, useStore, emptyMatch } from '../store.js';
@@ -225,9 +226,9 @@ function ModePill({ r }) {
 
 // ---- the radar intro ----------------------------------------------------------------------------------------------------
 
-const SEAT_BOX = [[640, 355], [1145, 355], [640, 640], [1145, 640]];
 const GHOSTS = [['left_up', 480, 200], ['right_up', 1310, 200], ['left_down', 480, 750], ['right_down', 1310, 750]];
 
+/** 展示结算雷达及所有参与者；计时或用户跳过都会触发下一页回调。 */
 function SettleIntro({ players, myId, lose, onDone }) {
   const done = useRef(onDone);
   done.current = onDone;
@@ -238,8 +239,9 @@ function SettleIntro({ players, myId, lose, onDone }) {
     return () => { clearTimeout(id); removeEventListener('keydown', skip); };
   }, []);
   const s = lose ? 'f' : 's';
-  const seats = SEAT_BOX.map((xy, i) => ({ xy, p: players.find((p) => p.seat === i) || null }));
-  return html`<div class=${cx('sintro', lose && 'is-lose')} data-testid="settle-intro" onClick=${() => done.current()}>
+  const seats = settlementIntroSeats(players);
+  const dense = players.length > 4 || players.some((p) => p.seat >= 4);
+  return html`<div class=${cx('sintro', dense && 'sintro--dense', lose && 'is-lose')} data-testid="settle-intro" onClick=${() => done.current()}>
     <div class="settle__stage" aria-hidden="true">
       <${Sprite} k="settle/aim" class="sintro__aim" />
       <${Sprite} k=${`settle/before_round_${s}`} class="sintro__ring" fallback=${html`<i class="sintro__ring sintro__ring--css"></i>`} />
@@ -247,9 +249,10 @@ function SettleIntro({ players, myId, lose, onDone }) {
       <${Sprite} k=${`settle/before_down_frame_${s}`} class="sintro__frame sintro__frame--down" />
       ${GHOSTS.map(([k, x, y], i) => html`<span key=${k} class="sintro__ghost" style=${`${at(x, y)};--i:${i}`}>
         <${Sprite} k=${k === 'right_down' ? 'settle/blank_right_down' : `settle/blank_${k}_${s}`} /></span>`)}
-      ${seats.map(({ xy: [x, y], p }, i) => html`<span key=${i} style=${`${at(x, y)};--i:${i}`}
+      ${seats.map(({ xy: [x, y], p, number }, i) => html`<span key=${number} style=${`${at(x, y)};--i:${i}`}
           class=${cx('sintro__seat', !p && 'is-empty', p && p.playerId === myId && 'is-me', p && p.alive === false && 'is-out', p && p.left && 'is-left')}>
-        <${Sprite} k=${`settle/before_middle_${s}_${pad2(i + 1)}`} fallback=${html`<b class="sintro__tile num">${pad2(i + 1)}</b>`} /></span>`)}
+        ${dense ? html`<b class="sintro__tile num">${pad2(number)}</b>`
+          : html`<${Sprite} k=${`settle/before_middle_${s}_${pad2(number)}`} fallback=${html`<b class="sintro__tile num">${pad2(number)}</b>`} />`}</span>`)}
       <span class="sintro__core" style=${at(888, 469)}><${Sprite} k=${`settle/before_middle_${s}`} fallback=${html`<b class="sintro__tile num">00</b>`} /></span>
       <${Sprite} k="settle/img_text" class="sintro__foot" fallback=${html`<small class="sintro__foot">RHODES ISLAND STRONGHOLD PROTOCOL</small>`} />
       <${Logo} />
@@ -535,7 +538,7 @@ function TeamPage({ r, res, gd, myId, at: when, content, backLabel, onBack, onDe
     <div class="steam__bg" aria-hidden="true"><${Sprite} k=${`settle/settlemen_teamshow_${bg}`} /></div>
     <div class="settle__stage">
       <${Logo} />
-      <div class="steam__cards" style=${`--n:${r.players.length}`}>
+      <div class=${cx('steam__cards', r.players.length > 4 && 'steam__cards--many')} style=${`--n:${r.players.length}`} tabIndex="0" role="region" aria-label=${t('同盟成员')}>
         ${r.players.length ? r.players.map((p, i) => html`<${TeamCard} key=${p.playerId} p=${p} i=${i} gd=${gd} self=${p.playerId === myId} victory=${r.victory} raw=${rawOf(p.playerId)} />`)
           : html`<p class="steam__none">${t('暂无结算数据')}</p>`}
       </div>

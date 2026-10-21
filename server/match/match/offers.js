@@ -109,9 +109,10 @@ export class MatchOffers {
     return OK;
   }
 
+  /** 判断给定玩家能否领取候选奖励；装备只读取接收者库存，不与其他个人池竞争。 */
   _offerAvailable(ps, card) {
     const effect = card.effect;
-    if (effect.item) return !!ps.gd.item(effect.item) && this.itemPool.canGain(effect.item);
+    if (effect.item) return !!ps.gd.item(effect.item) && ps.itemPool.canGain(effect.item);
     if (effect.chess) {
       const rec = ps.gd.chess(effect.chess);
       return !!rec && (!rec.isDiy || !!rec.diyFor);

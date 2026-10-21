@@ -48,23 +48,30 @@ export function narrowDeflateOffer(header) {
 }
 
 /**
- * The session stack of one server.
+ * 创建单实例会话、房间与网络层；维护检查仅影响新开局，不中断已存在的连接。
  * @param {{ MatchClass?: Function, seedFn?: () => number, [option: string]: any }} opts startServer() options
  * @param {{ data: object, log: object, content?: { cs: string } | null,
  *   plugins?: ReturnType<typeof import('../plugins/roomSets.js').createRoomSets> | null,
- *   hosts?: ReturnType<typeof import('../match/host/index.js').createMatchHosts> | null }} deps the game data the lobby's
+ *   hosts?: ReturnType<typeof import('../match/host/index.js').createMatchHosts> | null, isDraining?: (() => boolean) | null }} deps the game data the lobby's
  *   matches use, the logger, the vanilla content (server/plugins/identity.js: welcome / room.state content, BattleSpec
  *   cs), the room sets a room's host chooses from (room.setPlugins: visual and content sets), the match hosts a room with
  *   gameplay plugins plays in (DESIGN §32.6)
  * @returns {{ registry: SessionRegistry, lobby: Lobby, network: Network }}
  */
-export function createSessionStack(opts, { data, log, content = null, plugins = null, hosts = null }) {
+export function createSessionStack(opts, { data, log, content = null, plugins = null, hosts = null, auth = null, admission = null, isDraining = null }) {
   const netOptions = netOptionsFrom(opts);
-  const registry = new SessionRegistry({ reconnectWindowMs: netOptions.reconnectWindowMs ?? NET_DEFAULTS.reconnectWindowMs });
+  // Public account seats retain their quota for exactly ten minutes, including solo matches.
+  if (auth !== null) netOptions.reconnectWindowMs = NET_DEFAULTS.reconnectWindowMs;
+  const registry = new SessionRegistry({ reconnectWindowMs: netOptions.reconnectWindowMs ?? NET_DEFAULTS.reconnectWindowMs, maxSessions: netOptions.maxSessions ?? NET_DEFAULTS.maxSessions });
   const lobbyOptions = lobbyOptionsFrom(opts);
-  const lobby = new Lobby({ registry, log, MatchClass: opts.MatchClass, getData: () => data, seedFn: opts.seedFn, content, plugins, hosts, options: lobbyOptions });
-  const network = new Network({ registry, handler: lobby, log, options: netOptions });
-  return { registry, lobby, network };
+  const lobby = new Lobby({ registry, log, MatchClass: opts.MatchClass, getData: () => data, seedFn: opts.seedFn, content, plugins, hosts, auth, admission, isDraining, options: lobbyOptions });
+  try {
+    const network = new Network({ registry, handler: lobby, log, auth, options: netOptions });
+    return { registry, lobby, network };
+  } catch (error) {
+    try { lobby.shutdown(); } catch { /* keep the original construction failure */ }
+    throw error;
+  }
 }
 
 /**
@@ -92,11 +99,13 @@ function meterSocket(ws, req, traffic) {
  * @param {{ network: Network, log: object, traffic?: ReturnType<typeof import('./traffic.js').createTrafficCounter> }} deps
  * @returns {WebSocketServer}
  */
-export function attachWebSocket(server, { network, log, traffic = null }) {
+export function attachWebSocket(server, { network, log, traffic = null, auth = null }) {
+  const identities = new WeakMap();
   const wss = new WebSocketServer({ noServer: true, maxPayload: WS_MAX_PAYLOAD, perMessageDeflate: { ...WS_DEFLATE }, clientTracking: false });
   wss.on('connection', (ws, req) => {
     if (traffic) meterSocket(ws, req, traffic);
-    network.handleConnection(ws, req);
+    network.handleConnection(ws, req, identities.get(req) || null);
+    identities.delete(req);
   });
   wss.on('error', (e) => log.error('[ws] server error', e));
 
@@ -107,6 +116,16 @@ export function attachWebSocket(server, { network, log, traffic = null }) {
       try { socket.end(`HTTP/1.1 ${status} ${text}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`); } catch { socket.destroy(); }
     };
     if (!parts || parts.rawPath !== '/ws') { reject(404, 'Not Found'); return; }
+    if (auth) {
+      try {
+        const identity = auth.websocketIdentity(req);
+        if (!identity) { reject(401, 'Unauthorized'); return; }
+        identities.set(req, identity);
+      } catch {
+        reject(503, 'Service Unavailable');
+        return;
+      }
+    }
     const refused = network.admission(req);
     if (refused === 'per-address') { reject(429, 'Too Many Requests'); return; }
     if (refused) { reject(503, 'Service Unavailable'); return; }

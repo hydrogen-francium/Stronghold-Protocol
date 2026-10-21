@@ -1,0 +1,110 @@
+name: stronghold
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
+
+services:
+  assets-init:
+    build:
+      context: .
+      dockerfile: deploy/assets.Dockerfile
+    image: stronghold-assets:v0.3.1
+    user: "1000:1000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - assets:/srv/assets
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m,uid=1000,gid=1000,mode=1700
+    mem_limit: 512m
+    pids_limit: 32
+    cpus: 1.0
+    restart: "no"
+    logging: *logging
+
+  app:
+    build:
+      context: .
+    image: stronghold-app:v0.3.1-fork
+    init: true
+    user: "1000:1000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      assets-init:
+        condition: service_completed_successfully
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "3000"
+      TRUST_PROXY: "1"
+      SP_AUTH_ORIGIN: https://${SP_DOMAIN:?必须设置公网域名 SP_DOMAIN}
+      SP_ENTRY_TOKEN_FILE: /run/secrets/entry_token
+      SP_SESSION_SECRET_FILE: /run/secrets/session_secret
+      SP_STATE_DIR: /srv/state
+      SP_ASSET_BUNDLE_DIR: /srv/assets/v0.3.1-d2f48f7fd269
+      SP_DRAIN_FILE: /srv/state/draining
+      SP_REGISTRATION_OPEN: ${SP_REGISTRATION_OPEN:-1}
+      SP_STUDIO: "off"
+      SP_PLUGIN_SCRIPTS: "off"
+    secrets: [entry_token, session_secret]
+    volumes:
+      - assets:/srv/assets:ro
+      - state:/srv/state
+      - plugins:/app/plugins
+      - cache:/app/.cache
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m,uid=1000,gid=1000,mode=1700
+    networks: [backend]
+    mem_limit: 3g
+    cpus: 2.0
+    pids_limit: 256
+    stop_grace_period: 15s
+    restart: unless-stopped
+    logging: *logging
+
+  proxy:
+    image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      SP_DOMAIN: ${SP_DOMAIN:?必须设置公网域名 SP_DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL:?必须设置证书联系人 ACME_EMAIL}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - tls:/data
+      - proxy_config:/config
+    networks: [backend, edge]
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 64
+    restart: unless-stopped
+    logging: *logging
+
+secrets:
+  entry_token:
+    file: ${SP_ENTRY_TOKEN_PATH:?必须提供准入密钥文件 SP_ENTRY_TOKEN_PATH}
+  session_secret:
+    file: ${SP_SESSION_SECRET_PATH:?必须提供会话密钥文件 SP_SESSION_SECRET_PATH}
+
+networks:
+  backend:
+    internal: true
+  edge: {}
+
+volumes:
+  assets: {}
+  state: {}
+  plugins: {}
+  cache: {}
+  tls: {}
+  proxy_config: {}

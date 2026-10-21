@@ -77,6 +77,9 @@ export function installTestTrace(m, opts) {
   for (const key of ['roomCode', 'mode', 'difficulty', 'modeId', 'seats', 'spectators', 'seed', 'matchNo', 'hostId', 'aiPicksLast', 'cs', 'vs', 'requireCs', 'kitted', 'rules', 'offers']) {
     if (opts[key] !== undefined) options[key] = clone(opts[key]);
   }
+  // Runtime metadata is not part of content identity / plugin rules. Record the frozen snapshot rather than
+  // caller-owned options; replay passes it back through the Match constructor's fail-closed roster validation.
+  if (m.runtimeContext) options.runtimeContext = clone(m.runtimeContext);
   Object.assign(options, {
     test: true, seed: m.seed, timerScale: m.timerScale, combatSpeed: m.gameSpeed,
     clientCombat: m.clientCombat, verify: m.verifyMode, battleContent: m.battleContent,

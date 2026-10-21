@@ -10,3 +10,9 @@ export function clone(v) {
   for (const k of Object.keys(v)) o[k] = clone(v[k]);
   return o;
 }
+
+/** 判断两个地图医疗实例能否共用原位置；仅同目标玩家、不同策略来源的地图角色可以叠放。 */
+export function shareMapCharTile(a, b) {
+  return !!(a?.mapCharSource && b?.mapCharSource && a.ownerId === b.ownerId
+    && (a.mapCharSource.playerId !== b.mapCharSource.playerId || a.mapCharSource.bandId !== b.mapCharSource.bandId));
+}

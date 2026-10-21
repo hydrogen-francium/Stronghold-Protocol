@@ -390,26 +390,30 @@ export function Countdown({ deadline, seconds, total, warnAt = 10, label = 'COUN
 
 // ---- Modal & dialogs ---------------------------------------------------------------------------
 
-const modalStack = []; // open modals, topmost last: only the topmost handles keyboard focus / Escape
+const modalStack = []; // topmost priority modal first, otherwise last opened: only one owns focus / Escape
 
 /**
  * Modal dialog (declarative). Esc / backdrop click call onClose.
  * @param {{ open: boolean, title?: any, micro?: string, tone?: string, onClose?: Function, actions?: any,
- *   width?: string, closeOnBackdrop?: boolean, class?: string, veilClass?: string, children?: any }} props
+ *   width?: string, closeOnBackdrop?: boolean, priority?: boolean, class?: string, veilClass?: string, children?: any }} props
  * `veilClass` styles the backdrop itself (e.g. a dialog that dims the field without blurring it).
+ * `priority` keeps account recovery above existing dialogs and the guide without dismissing their state.
  */
-export function Modal({ open, title, micro, tone = 'mint', onClose, actions, width, closeOnBackdrop = true, class: cls, veilClass, children }) {
+export function Modal({ open, title, micro, tone = 'mint', onClose, actions, width, closeOnBackdrop = true, priority = false, class: cls, veilClass, children }) {
   const boxRef = useRef(null);
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
   useLayoutEffect(() => {
     if (!open) return undefined;
-    const token = {};
+    const token = { priority };
     modalStack.push(token);
     const prevFocus = typeof document !== 'undefined' ? document.activeElement : null;
     const box = boxRef.current;
-    // The independent guide can open above SettingsModal (its z-index is higher than --z-modal).
-    const topmost = () => modalStack[modalStack.length - 1] === token && !document.querySelector('.guide');
+    // The guide is above normal dialogs, but account recovery must stay reachable even if another dialog opens late.
+    const topmost = () => {
+      const top = [...modalStack].reverse().find((item) => item.priority) || modalStack[modalStack.length - 1];
+      return top === token && (priority || !document.querySelector('.guide'));
+    };
     const available = (el) => !el.matches(':disabled') && !el.closest('[inert]') && el.getClientRects().length > 0
       && getComputedStyle(el).visibility !== 'hidden';
     const tabbable = () => [...box.querySelectorAll('button, [href], input, select, textarea, [tabindex], summary')]
@@ -444,11 +448,12 @@ export function Modal({ open, title, micro, tone = 'mint', onClose, actions, wid
       window.removeEventListener('focusin', onFocus);
       const i = modalStack.indexOf(token);
       if (i >= 0) modalStack.splice(i, 1);
-      prevFocus?.focus?.();
+      const guide = priority ? document.querySelector('.guide__box') : null;
+      (guide || prevFocus)?.focus?.();
     };
-  }, [open]);
+  }, [open, priority]);
   if (!open) return null;
-  return html`<div class=${cx('modal', veilClass)} role="presentation"
+  return html`<div class=${cx('modal', priority && 'modal--priority', veilClass)} role="presentation"
       onMouseDown=${(e) => { if (closeOnBackdrop && e.target === e.currentTarget && onClose) onClose(); }}>
     <div ref=${boxRef} class=${cx('modal__box', 'brackets', `modal__box--${tone}`, cls)} role="dialog" aria-modal="true" tabindex="-1"
          style=${width ? `width:${width}` : undefined}>

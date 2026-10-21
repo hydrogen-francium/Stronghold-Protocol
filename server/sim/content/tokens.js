@@ -100,6 +100,7 @@ import { SKILL_SUMMON_START_DEPLOY } from '../../../shared/constants.js';
 import { hypot } from '../detmath.js';
 import { atPotential } from '../../../shared/potential.js';
 import { textFinite } from '../../../shared/plugins/textNumber.js';
+import { shareMapCharTile } from '../battle/util.js';
 
 const num = (v, d = 0) => (typeof v === 'number' && Number.isFinite(v) ? v : (typeof v === 'string' && v.trim() !== '' && Number.isFinite(+v) ? +v : d));
 const GRID_3X3 = Object.freeze([[1, -1], [1, 0], [1, 1], [0, -1], [0, 0], [0, 1], [-1, -1], [-1, 0], [-1, 1]]);
@@ -1569,12 +1570,10 @@ function touchKit(bb, raw, def) {
 }
 
 /**
- * Spawn a band map character (char_605_cmedic 预备干员-医疗 / char_613_acmedc Touch) at its stage position on the
- * player's half (data/stages.json `mapChars`; `_multi_only` positions only with a partner). A prepared character may
- * supply `preBattleAggroSeq` so its targeting order precedes the ordinary battle-start deployment. Returns the unit
- * or null.
+ * 在目标玩家的原关卡位置生成地图医疗并返回单位或空值；持有人来源允许同位置保留独立实例。
+ * preBattleAggroSeq 保留整备预置角色的受击顺序；副作用为创建、部署单位并注册其技能。
  */
-export function spawnMapChar(battle, playerId, tokenId, { alias = null, preBattleAggroSeq = null } = {}) {
+export function spawnMapChar(battle, playerId, tokenId, { alias = null, preBattleAggroSeq = null, mapCharSource = null } = {}) {
   const list = battle.stage?.raw?.mapChars ?? battle.stage?.mapChars ?? [];
   const ps = battle.getPlayer(playerId);
   const multi = battle.players.length > 1;
@@ -1589,9 +1588,11 @@ export function spawnMapChar(battle, playerId, tokenId, { alias = null, preBattl
   const halfOk = (m) => !ps || battle.players.length < 2 || (span ? m.pos[1] >= span[0] && m.pos[1] <= span[1] : (ps.half === 'R' ? m.pos[1] >= 11 : m.pos[1] <= 10));
   cands.sort((a, b) => (halfOk(b) ? 1 : 0) - (halfOk(a) ? 1 : 0) || (/multi_only/.test(String(a.alias)) ? 1 : 0) - (/multi_only/.test(String(b.alias)) ? 1 : 0));
   for (const m of cands) {
-    if (!tileFree(battle, m.pos[0], m.pos[1])) continue;
+    // 重复医疗使用同一原始位置，不挤占其他候选位置，更不扩展地图。
+    const shared = shareMapCharTile({ ownerId: playerId, mapCharSource }, battle._occ[m.pos[0] * COLS + m.pos[1]]);
+    if (!shared && !tileFree(battle, m.pos[0], m.pos[1])) continue;
     // stage positions are field tiles: their direction is taken as it is (default RIGHT)
-    const u = battle.spawnToken(playerId, tokenId, m.pos[0], m.pos[1], { dir: normDir(m.dir), preBattleAggroSeq });
+    const u = battle.spawnToken(playerId, tokenId, m.pos[0], m.pos[1], { dir: normDir(m.dir), preBattleAggroSeq, mapCharSource });
     if (u) return u;
   }
   return null;

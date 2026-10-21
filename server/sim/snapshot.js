@@ -32,6 +32,8 @@ export function unitInfo(u) {
     kind: u.kind,
     side: u.side,
     ownerId: u.ownerId ?? null,
+    // 逻辑实例不能因同策略或同位置被客户端合并；赏金敌人也保留策略来源。
+    ...(u.mapCharSource || u.bounty?.bandSource ? { bandSource: { ...(u.mapCharSource ?? u.bounty.bandSource) } } : {}),
     defId: u.defId,
     name: u.name,
     tier: d.tier ?? (d.rank === 'BOSS' ? 3 : d.rank === 'ELITE' ? 2 : 1),

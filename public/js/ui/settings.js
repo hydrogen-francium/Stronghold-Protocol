@@ -160,6 +160,7 @@ function HotkeySection({ keys, touchUi }) {
     if (!waiting) return undefined;
     const name = t(HOTKEY_NAMES[waiting]);
     const onKey = (e) => {
+      if (document.querySelector('.modal--priority')) return;
       const r = captureHotkey(e);
       if (r.kind === 'leave') { setWaiting(null); return; } // Tab: the focus moves on
       // ahead of the dialog's own Esc (it stays open), a focused button's Enter / Space and every other key handler

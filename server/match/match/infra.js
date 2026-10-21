@@ -86,9 +86,10 @@ export class MatchInfra {
 
   alivePlayers() { return this.order.filter((p) => p.alive); }
 
-  /** Whether any chess of a bond is in this match's pool (a 驰援 card of a fully banned bond is never offered). */
+  /** 检查指定羁绊是否存在于本局禁用过滤后的干员目录；个人池目录一致，不以某人的余量判定全队禁用。 */
   bondInPool(bondId) {
-    for (const id of this.pool.entries.keys()) {
+    // 所有普通池使用相同禁用集合；找到首个合法成员即可确认目录存在该羁绊。
+    for (const id of this.order[0].chessPool.entries.keys()) {
       const c = this.gd.chess(id);
       if (c && Array.isArray(c.bonds) && c.bonds.includes(bondId)) return true;
     }
@@ -107,6 +108,13 @@ export class MatchInfra {
 
   /** [ASSUMED] Touch's initial, match-long team grant survives its holder's elimination/quit; focus alone grants none. */
   teamMedicGranted() { return this.order.some(p => (this.gd.band(p.bandId)?.effectRef ?? p.bandId) === 'band_amedic'); }
+
+  /** 返回超过四人局的医疗授予来源；保留已淘汰持有人的整局授予，四人以内不改变原输入。 */
+  teamMedicSources() {
+    if (!this.runtimeContext.personalPools) return null;
+    return this.order.filter(p => (this.gd.band(p.bandId)?.effectRef ?? p.bandId) === 'band_amedic')
+      .map(p => ({ playerId: p.playerId, bandId: p.bandId }));
+  }
 
   /**
    * The boss-round group of a player (`bossWaves`: the per-match random pairs, planned in startRound

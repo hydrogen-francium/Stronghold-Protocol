@@ -42,6 +42,7 @@ import { toDataSource, withUnitLoadouts } from './simdata.js';
 import { isPotential, isCultivate } from '../../shared/potential.js';
 import { isContentHash } from '../../shared/plugins/identity.js';
 import { BOSS_POOL_MIN_HP } from './constants.js';
+import { RESULT_LIMITS } from '../../shared/protocol.js';
 
 export const SPEC_VERSION = 1;
 
@@ -319,7 +320,7 @@ export function battleProgress(battle) {
   }
   if (battle && (battle.kind === 'boss' || battle.kind === 'hidden')) {
     const leaksBy = {};
-    for (const pid of Object.keys(pp).slice(0, 4)) leaksBy[pid] = Math.min(1e6, leakEntries(pp[pid]).reduce((n, l) => n + leakLpr(l), 0));
+    for (const pid of Object.keys(pp).slice(0, RESULT_LIMITS.players)) leaksBy[pid] = Math.min(1e6, (pp[pid].leaked || []).reduce((n, l) => n + leakLpr(l), 0));
     out.leaksBy = leaksBy;
   }
   return out;
@@ -459,26 +460,43 @@ export function compactResult(res) {
   return out;
 }
 
-/** Bytes a b.result frame may use (the socket's inbound limit is 64 KB; headroom for the envelope). */
+/** 完整结果信封的字节预算；为连接的六十四千字节入口上限保留余量。 */
 export const RESULT_FRAME_BUDGET = 60 * 1024;
 
 /**
- * Keep a compact result under the frame budget (a larger frame closes the socket: the server would take the field over
- * at the very end). Never touches what settles LP / funds / layers of a normal field. In order: drop the per-unit
- * statistics, drop the leaks' `mods` (the server rebuilds them from the spec), and — boss fields only, whose leaks cost
- * team LP through b.progress — drop leak entries. Returns the (possibly) trimmed copy.
- * @param {object} result compactResult(...) output
- * @param {{ bossLike?: boolean, budget?: number, battleId?: string }} [o]
+ * 仅裁掉展示统计以满足报告预算；结算账本无法完整发送时返回空值，调用方必须声明服务端接管。
+ * @param {object} result 已压缩但仍完整的结算报告。
+ * @param {{ budget?: number, battleId?: string, cs?: string }} [o] 信封信息与字节预算。
+ * @returns {object|null} 可发送结果，或不能无损容纳的空值；不修改输入。
  */
-export function fitResult(result, { bossLike = false, budget = RESULT_FRAME_BUDGET, battleId = '' } = {}) {
-  const size = (r) => JSON.stringify({ t: 'b.result', battleId, result: r, rid: 2147483647 }).length;
+export function fitResult(result, { budget = RESULT_FRAME_BUDGET, battleId = '', cs = null } = {}) {
+  /** 以完整信封的编码字节计费，包含内容集与请求编号，而不是字符串字符数。 */
+  const size = (r) => new TextEncoder().encode(JSON.stringify({ t: 'b.result', battleId, result: r, rid: 2147483647, ...(cs ? { cs } : {}) })).byteLength;
   if (!result || typeof result !== 'object' || size(result) <= budget) return result;
   const r = { ...result, perPlayer: {} };
   for (const [pid, p] of Object.entries(result.perPlayer || {})) r.perPlayer[pid] = { ...p, unitStats: [] };
   if (size(r) <= budget) return r;
-  for (const p of Object.values(r.perPlayer)) p.leaked = (p.leaked || []).map((l) => ({ ...l, mods: null }));
-  if (size(r) <= budget || !bossLike) return r;
-  for (const p of Object.values(r.perPlayer)) p.leaked = [];
-  if (Array.isArray(r.unspawned)) r.unspawned = [];
-  return r;
+  return null;
+}
+
+/**
+ * 从完整模拟账本生成发送决策；所有影响结算的列表先检查上限，禁止先截断再宣称报告合法。
+ * @param {object} res 原始战斗结果。
+ * @param {object} [options] 传给信封预算检查的战场及内容集信息。
+ * @returns {{result: object|null, reason: string|null}} 无损报告或明确的接管理由；无副作用。
+ */
+export function prepareResultReport(res, options = {}) {
+  const players = Object.values(res.perPlayer || {});
+  // 超限账本交由原服务端任务结算，不能把漏怪、未出生敌人、装备修正或续战状态当展示信息裁掉。
+  if (players.length > RESULT_LIMITS.players || (res.unspawned || []).length > RESULT_LIMITS.unspawned
+      || players.some((p) => (p.leaked || []).length > RESULT_LIMITS.leaked
+        || (p.unitsEnd || []).length > RESULT_LIMITS.unitsEnd
+        || Object.keys(p.layerGains || {}).length > RESULT_LIMITS.layerGains
+        || (p.leaked || []).some((l) => Object.entries(l.mods || {}).length > RESULT_LIMITS.mods
+          || Object.entries(l.mods || {}).some(([key, value]) => key.length > 32
+            || (typeof value === 'string' ? value.length > 64 : value !== null && typeof value !== 'boolean' && !(typeof value === 'number' && Number.isFinite(value))))))) {
+    return { result: null, reason: 'accounting_limit' };
+  }
+  const result = fitResult(compactResult(res), options);
+  return { result, reason: result ? null : 'frame_budget' };
 }

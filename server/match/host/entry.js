@@ -23,7 +23,9 @@
 //   { type: 'create', matchId, opts }       new Match({ ...options.matchOptions, ...opts, data, log, now, send, broadcast,
 //                                           onEnd }) and start() — send / broadcast / onEnd post 'send' / 'broadcast' /
 //                                           'end' back; a match that cannot be created posts 'failed'
-//   { type: 'call', matchId, method, args, id? }   one MATCH INTERFACE call; with `id` its answer is posted as 'reply'
+//   { type: 'call', matchId, method, args, id? }   one synchronous MATCH INTERFACE call; with `id` its answer is posted as
+//                                           'reply'. Requested onLeave requires the real method (no disconnect fallback).
+//                                           Thenables are refused with INTERNAL, never awaited or serialized as success.
 //   { type: 'dispose', matchId }            the match is disposed and forgotten
 // Logs go to the main process ('log': its logger prefixes them with the set's `[cs:<8 hex>]`).
 // options.virtualTime (tests / tools only): the matches run on a VirtualScheduler stepped in 20 ms slices — an all-AI
@@ -32,6 +34,7 @@
 import { parentPort, workerData } from 'node:worker_threads';
 import { createHash } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
+import { ERR } from '../../../shared/constants.js';
 import { getData, setData } from '../../data.js';
 import { installOfficialBounds } from '../../../shared/plugins/officialBounds.js';
 import { contentHashOf } from '../../../shared/plugins/identity.js';
@@ -69,12 +72,12 @@ if (viaWorker) startBeat();
 const queue = [];
 let booted = false;
 let MatchClass = null;
+let runtimeOptions = null;
 let VirtualScheduler = null;
 /** Prep EffectRefs this content set grants to every player. Empty when the set has no data.dsl. */
 let dslGrants = [];
 /** @type {Map<string, any>} */
 const matches = new Map();
-const ERR_INTERNAL = 'INTERNAL';
 
 let started = viaWorker;
 const onMessage = (m) => {
@@ -166,7 +169,9 @@ async function boot() {
   }
   // After setData, before Match: Match reads opts.registry || getDefaultRegistry(), the same singleton.
   dslGrants = await installPrepDsl(data);
-  const mod = await import(typeof options.matchModule === 'string' && options.matchModule ? pathToFileURL(options.matchModule).href : '../Match.js');
+  const matchModule = await import('../Match.js');
+  runtimeOptions = matchModule.matchRuntimeOptions;
+  const mod = typeof options.matchModule === 'string' && options.matchModule ? await import(pathToFileURL(options.matchModule).href) : matchModule;
   const Inner = mod.Match || mod.default;
   if (typeof Inner !== 'function') throw new Error('the match module exports no Match');
   // [ASSUMED] Grant the prep EffectRefs after super(), once players exist (DESIGN §32.7).
@@ -183,9 +188,12 @@ async function boot() {
   if (options.virtualTime) ({ VirtualScheduler } = await import('../scheduler.js'));
 }
 
-/** A MATCH INTERFACE method a match class may lack: what the platform does then (server/lobby.js callMatch). */
-function fallback(match, method, args) {
-  if (method === 'onLeave' && typeof match.onDisconnect === 'function') return match.onDisconnect(...args);
+/** A missing MATCH INTERFACE method. Only a legacy notification may substitute disconnect for permanent leave. */
+function fallback(match, method, args, requested) {
+  if (method === 'onLeave') {
+    if (requested) return { error: ERR.WRONG_PHASE, detail: 'the match does not support onLeave' };
+    if (typeof match.onDisconnect === 'function') return match.onDisconnect(...args);
+  }
   if (method === 'setLoadout') return { error: 'ROOM_STARTED', detail: 'stored for the next match' };
   if (method === 'requestSetupReroll' || method === 'cancelSetupReroll') return { error: 'WRONG_PHASE' };
   return undefined;
@@ -194,7 +202,7 @@ function fallback(match, method, args) {
 /** A plain copy of a match's answer that a MessagePort can carry. */
 function plain(r) {
   if (r == null || typeof r !== 'object') return r ?? { ok: true };
-  try { return JSON.parse(JSON.stringify(r)); } catch { return { error: ERR_INTERNAL }; }
+  try { return JSON.parse(JSON.stringify(r)); } catch { return { error: ERR.INTERNAL }; }
 }
 
 /** The diagnostics of a match (tests): its phase, errors, verify counters and fields. */
@@ -202,6 +210,7 @@ function diag(match) {
   return {
     phase: match.phase ?? null, round: match.round ?? null, ended: !!match.ended, cs: match.cs ?? null, modeId: match.modeId ?? null,
     errorCount: match.errorCount ?? 0, errors: (match.errors || []).slice(0, 3).map((e) => String(e?.label || e?.message || e).slice(0, 200)),
+    ...(match.runtimeContext ? { runtimeContext: { ...match.runtimeContext } } : {}),
     verifyStats: match.verifyStats ? { ...match.verifyStats } : null, simErrors: match.simErrors ?? 0,
     fields: Array.isArray(match.fields) ? match.fields.map((f) => ({ fieldId: f.fieldId, kind: f.kind, players: Array.isArray(f.players) ? [...f.players] : [], mode: f.mode ?? null,
       authority: f.authority ?? null, done: !!f.done, resultSource: f.resultSource ?? null, battleId: f.battleId ?? null })) : [],
@@ -212,9 +221,11 @@ function create(matchId, opts) {
   const sched = options.virtualTime && VirtualScheduler ? new VirtualScheduler({ start: Date.now() }) : null;
   let match;
   try {
+    // Validate the actual IPC roster again, even with an injected Match implementation. Context-free probe modules
+    // keep their legacy options; an explicit context can never bypass the check through matchOptions or a custom class.
+    const bound = runtimeOptions({ ...(options.matchOptions || {}), ...opts });
     match = new MatchClass({
-      ...(options.matchOptions || {}),
-      ...opts,
+      ...bound,
       // the content set installed at boot (server/data.js getData)
       data: installed,
       // the match names itself in its lines ([match <code>] …), as in the server process (the host adds [cs:<8 hex>])
@@ -266,15 +277,23 @@ function handle(m) {
   }
   if (m.type === 'call') {
     let result;
-    if (!match) result = { error: 'WRONG_PHASE', detail: 'no running match' };
+    if (!match) result = { error: ERR.WRONG_PHASE, detail: 'no running match' };
     else if (m.method === 'diag') result = diag(match);
     else {
       try {
         const fn = match[m.method];
-        result = typeof fn === 'function' ? fn.apply(match, Array.isArray(m.args) ? m.args : []) : fallback(match, m.method, m.args || []);
+        const args = Array.isArray(m.args) ? m.args : [];
+        result = typeof fn === 'function' ? fn.apply(match, args) : fallback(match, m.method, args, m.id != null);
+        if (result != null && typeof result.then === 'function') {
+          // The MATCH INTERFACE is synchronous. Do not await/reorder this port's calls, or serialize a Promise as {}.
+          // Observe a rejected Promise without treating either its later success or failure as a departure confirmation.
+          Promise.resolve(result).catch(() => {});
+          log.error(`[host] match ${m.matchId} ${m.method} returned an asynchronous answer`);
+          result = { error: ERR.INTERNAL, detail: 'asynchronous match methods are not supported' };
+        }
       } catch (e) {
         log.error(`[host] match ${m.matchId} ${m.method} threw`, e);
-        result = { error: ERR_INTERNAL };
+        result = { error: ERR.INTERNAL };
       }
     }
     if (m.id != null) post({ type: 'reply', matchId: m.matchId, id: m.id, result: plain(result) });

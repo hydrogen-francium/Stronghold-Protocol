@@ -1,7 +1,6 @@
-// Local match statistics: every match the local player took part in is appended as one record to localStorage
-// (`sp.pref.stats`). Per-browser only — the server keeps matches in memory and has no identity, so there is nowhere
-// else for cross-match numbers to live; nothing here is ever sent anywhere. The stats page labels itself 本机数据 and
-// offers JSON export / import for moving between devices. (Ported from PR #323 by @2321Robin, reworked for 0.2.2.)
+// Local match statistics, scoped to the verified account in this browser. Persistent server login
+// does not make these records cloud statistics; nothing here uploads a record. Old guest keys are
+// deliberately not migrated or assigned by nickname.
 //
 // Two kinds of record (`end`):
 //   'settled'  the match reached its settlement: m.result arrived (server/match/results.js buildResult). The record
@@ -43,17 +42,18 @@
 // per-version steps and every loaded / imported record passes `normalizeRecord`, a strict schema: missing fields get
 // defaults, unknown fields and oversized values are dropped, a row it cannot salvage is dropped. An envelope from a
 // NEWER version than this build is refused (never downgraded and written back); an unreadable one is set aside
-// (`sp.pref.stats.damaged`) and the history starts again.
+// (the scoped stats key plus `.damaged`) and the history starts again.
 //
-// Pure logic, no Preact / DOM: Node-testable (test/ui/stats.test.js); localStorage is touched only by loadStats /
-// saveStats / their helpers.
+// The aggregation helpers are pure. Only persistence uses store.js' verified account namespace;
+// localStorage is touched only by loadStats / saveStats / their helpers.
 
-import { PHASE } from '../../../shared/constants.js';
+import { PHASE, MAX_SEATS } from '../../../shared/constants.js';
 import { sanitizeName } from './playerName.js';
+import { prefStorageKey } from '../store.js';
 
 /** Current record-envelope version (bump + add a MIGRATIONS step when the record shape changes). */
 export const STATS_VERSION = 2;
-/** localStorage key under the app's `sp.pref.` prefix (store.js loadPref). */
+/** Preference name resolved by store.js into the verified account's browser-local namespace. */
 export const STATS_PREF_KEY = 'stats';
 /** Oldest records are dropped beyond this many matches. */
 export const MAX_RECORDS = 1000;
@@ -64,8 +64,7 @@ export const MAX_CHARS = 800_000;
 /** Largest export file the page reads. */
 export const IMPORT_MAX_CHARS = 8_000_000;
 
-const FULL_KEY = `sp.pref.${STATS_PREF_KEY}`;
-const DAMAGED_KEY = `${FULL_KEY}.damaged`;
+const statsKey = () => prefStorageKey(STATS_PREF_KEY);
 
 /** @returns {{ v: number, records: Array }} a fresh empty envelope */
 export const emptyStats = () => ({ v: STATS_VERSION, records: [] });
@@ -94,7 +93,8 @@ const bool = (v, d = false) => (typeof v === 'boolean' ? v : d);
 const str = (v, max = 64) => (typeof v === 'string' && v.length ? v.slice(0, max) : null);
 
 // per-record bounds (an imported file is foreign data: nothing a row holds may grow without limit)
-const MAX_PLAYERS = 6; // the game seats 4
+// 记录边界必须覆盖全部合法席位，避免高位玩家本人被裁掉后冒认队友收益。
+const MAX_PLAYERS = MAX_SEATS;
 const MAX_LINEUP = 12;
 const MAX_ITEMS = 4;
 const MAX_BONDS = 24;
@@ -305,24 +305,28 @@ export function migrateStats(raw) {
   return { stats: { v: STATS_VERSION, records: kept }, changed, newer: false, dropped };
 }
 
-/** Read the raw stored string (null when absent or unreadable). */
-function readRaw() {
-  try { return globalThis.localStorage?.getItem(FULL_KEY) ?? null; } catch { return null; }
+/** Read an account-local stored string (null when absent or unreadable). */
+function readRaw(suffix = '') {
+  const key = statsKey();
+  if (!key) return null;
+  try { return globalThis.localStorage?.getItem(`${key}${suffix}`) ?? null; } catch { return null; }
 }
 
 /**
  * Read + migrate the persisted envelope; self-heals older shapes back to storage. An unreadable value (not JSON, or
- * not an envelope) is moved to `sp.pref.stats.damaged` — kept for a manual recovery — and the history starts again.
+ * not an envelope) is moved to the account's `stats.damaged` key — kept for a manual recovery — and history starts again.
  * @returns {{ v: number, records: any[], newer: boolean, dropped: number, damaged: boolean }}
  */
 export function loadStats() {
   const raw = readRaw();
-  if (raw == null) return { ...emptyStats(), newer: false, dropped: 0, damaged: false };
+  // The lobby's achievements may have backed up unreadable history before the statistics overlay first opens.
+  if (raw == null) return { ...emptyStats(), newer: false, dropped: 0, damaged: readRaw('.damaged') != null };
   let parsed;
   try { parsed = JSON.parse(raw); } catch { parsed = undefined; }
   if (!isObj(parsed) || !Array.isArray(parsed.records)) {
     // keep the bad value where a person can find it; if even that write fails the next save simply replaces it
-    try { globalThis.localStorage?.setItem(DAMAGED_KEY, raw); globalThis.localStorage?.removeItem(FULL_KEY); } catch { /* keep it in place */ }
+    const key = statsKey();
+    try { if (key) { globalThis.localStorage?.setItem(`${key}.damaged`, raw); globalThis.localStorage?.removeItem(key); } } catch { /* keep it in place */ }
     return { ...emptyStats(), newer: false, dropped: 0, damaged: true };
   }
   const { stats, changed, newer, dropped } = migrateStats(parsed);
@@ -400,13 +404,20 @@ export function highestBondRecord(records) {
  * @returns {boolean} whether a write stuck
  */
 export function saveStats(stats) {
-  if (stats.newer) return false;
+  const key = statsKey();
+  if (!key || stats.newer || stats.v > STATS_VERSION) return false;
   let recs = fitToBudget(stats.records.filter(r => r.test !== true));
   for (;;) {
     try {
       const ls = globalThis.localStorage;
       if (!ls) return false; // no storage at all (disabled by the browser)
-      ls.setItem(FULL_KEY, JSON.stringify({ v: STATS_VERSION, records: recs }));
+      let raw;
+      try { raw = ls.getItem(key); } catch { return false; }
+      let current;
+      try { current = JSON.parse(raw); } catch { /* unreadable JSON can be replaced, unlike a newer version */ }
+      // Another same-account document may have upgraded history since load, even between quota retries.
+      if (isObj(current) && current.v > STATS_VERSION) return false;
+      ls.setItem(key, JSON.stringify({ v: STATS_VERSION, records: recs }));
       return true;
     } catch { /* quota or storage disabled — fall through to shrinking */ }
     if (recs.length <= 8) return false; // a small history that still does not fit is foreign quota pressure
@@ -729,37 +740,36 @@ export function exportStats(stats) {
 const SELF_STATS = ['dmgDealt', 'kills', 'bossDamage', 'activatedLayers', 'merges', 'itemsEquipped', 'gold', 'perfectRounds', 'refreshes', 'leaks', 'lpLost'];
 
 /**
- * The row that "is me" in a record: selfId, else the only human, else seat 0 — records written by
- * recordResult always have selfId; the fallbacks only serve imported / hand-made data.
+ * 按记录中的本人标识查找个人行；已指定标识却缺行时返回未知，禁止借用队友数据。
+ * 仅未指定本人标识的既有导入记录继续使用原有真人优先规则。
  * @param {any} rec
  * @returns {any|null}
  */
 export function selfRowOf(rec) {
   const ps = Array.isArray(rec?.players) ? rec.players : [];
-  return ps.find((p) => p.playerId && p.playerId === rec.selfId)
-    || ps.find((p) => !p.isBot)
+  if (rec?.selfId) return ps.find((p) => p.playerId === rec.selfId) || null;
+  return ps.find((p) => !p.isBot)
     || ps[0]
     || null;
 }
 
-/** Whether this record counts as a win for its self player (per-row victory = team won AND still in). */
-const selfWon = (rec, self) => (self ? !!self.victory : !!rec.victory);
+/** 本人已知时采用个人胜利；明确缺失的本人不能继承团队胜利。 */
+const selfWon = (rec, self) => (self ? !!self.victory : !rec.selfId && !!rec.victory);
 
 /**
- * The rounds the player passed in a record: its own row's (the table the settlement prints per player), else the
- * team's; 0 when the record does not know.
+ * 读取本人通过回合；明确缺失的本人返回零，只有无身份的既有记录使用团队回合。
  * @param {any} rec
  */
 export function roundsOf(rec) {
   const self = selfRowOf(rec);
+  if (rec?.selfId && !self) return 0;
   const v = self && Number.isFinite(self.roundsPassed) ? self.roundsPassed : rec?.roundsPassed;
   return Number.isFinite(v) ? v : 0;
 }
 
 /**
- * Whether a record enters the aggregates (see the header). A settled record always does. A quit record does once the
- * player had finished at least one battle: cleared a round, or was already eliminated; a match given up before that —
- * entered and left right away — is history only.
+ * 判断记录是否进入个人累计；缺少明确指定的本人行时仅保留历史，不计队友收益。
+ * 放弃记录还要求本人已完成战斗或已淘汰，避免刚进入就退出增加场次。
  * @param {any} rec a normalized record
  * @returns {boolean}
  */
@@ -767,6 +777,7 @@ export function countsTowardStats(rec) {
   if (!isObj(rec)) return false;
   // Legacy test records never count. There is no switch that counts it (DESIGN §34.8).
   if (rec.test === true) return false;
+  if (rec.selfId && !selfRowOf(rec)) return false;
   if (rec.end !== 'quit') return true;
   const self = selfRowOf(rec);
   if (!self) return false;

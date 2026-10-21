@@ -36,7 +36,7 @@ export class MatchIntents {
       case 'g.destroy': return ps.destroy(msg.uid);
       case 'g.unequip': return ps.unequip(msg.itemUid);
       case 'g.reward': return ps.pickReward(msg.idx);
-      case 'g.choice': return msg.choiceId !== undefined
+      case 'g.choice': return this.phase === PHASE.SP_DRAFT && this.sp?.personal ? this.pickCard(ps, msg.idx, msg.choiceId) : msg.choiceId !== undefined
         ? this.pickPersonalChoice(ps, msg.idx, msg.choiceId)
         : this.pickCard(ps, msg.idx);
       // a plugin interaction window (PLUGIN API v2, docs/PLUGINS.md §10b): the window's own id, not a draft card —
@@ -55,6 +55,7 @@ export class MatchIntents {
       case 'g.test': return this.applyTestCommand(ps, msg);
       case 'b.progress': return this._onProgress(ps, msg);
       case 'b.result': return this._onResult(ps, msg);
+      case 'b.resultFallback': return this._onResultFallback(ps, msg);
       // the host's answer to a delegated bot layout rehearsal (DESIGN §14): a report, never an error — an unknown,
       // expired or foreign task is ignored (MatchRehearsal._onRehearsalResult)
       case 'b.rehearsalResult': this._onRehearsalResult(ps, msg); return OK;

@@ -1,6 +1,7 @@
 // [ASSUMED] Checks share the trial bench's 20 s / 512 MiB child budget; at most two run concurrently.
 import { fork } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { childEnvironment } from '../auth/child-env.js';
 import { StudioError } from './files.js';
 let active = 0;
 export function checkCandidate(request, { spawn = fork, timeoutMs = 20000 } = {}) {
@@ -17,7 +18,7 @@ export function checkCandidate(request, { spawn = fork, timeoutMs = 20000 } = {}
     const fail = e => { error ||= e; if (child?.pid) child.kill('SIGKILL'); else finish(); };
     try {
       child = spawn(fileURLToPath(new URL('./checkChild.js', import.meta.url)), [], {
-        execArgv: ['--max-old-space-size=512'], stdio: ['ignore', 'ignore', 'ignore', 'ipc'], serialization: 'json',
+        env: childEnvironment(), execArgv: ['--max-old-space-size=512'], stdio: ['ignore', 'ignore', 'ignore', 'ipc'], serialization: 'json',
       });
       timer = setTimeout(() => fail(new StudioError('PLUGIN_STUDIO_TRIAL_TIMEOUT', 504)), timeoutMs);
       child.once('error', () => fail(new StudioError('PLUGIN_STUDIO_TRIAL_FAILED', 500)));

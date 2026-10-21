@@ -54,3 +54,21 @@ npm run golden                              # golden results
 Browser suites are off by default and need Chrome: `SP_E2E=1` (UI), `SP_REAL_E2E=1` (real match, needs assets),
 `RENDER_E2E=1`, `SIM_E2E=1` — see CONTRIBUTING.md §2. Battle tests are easiest with the helpers described in
 docs/SIM.md (the test harness section) and the patterns in `test/content/op_siege.test.js`.
+
+## 执行补充规约
+
+- **不要钻测试的牛角尖。** 以当前功能交付和实际可用为主，只做与改动相关的必要验证；不以清零历史测试失败为默认目标。非阻塞问题记录后继续推进，真实阻塞和安全风险不得掩盖。
+- 同一问题连续两轮“定位—修改—定向验证”未解决，就停止自动深入、记录影响并后置，不扩建诊断体系。用户默认同意主计划范围内的下一步本地实施，不进行阶段性询问或汇报；不因此自动提交、推送、发布或连接生产服务器。
+
+## 当前仓库索引
+
+- 遇到 `项目接手、源码与运行副本区分、认证与 Admission、4/8/16 人容量、Compose 验收或账号切换浏览器失败` 时，**必须**优先读取 `.context/architecture/project-handover.md`。
+- 遇到 `测试投入范围、历史失败排查、反复重跑、验证阻塞功能推进或接手优先级` 时，**必须**优先读取 `.context/conventions/verification-scope.md`。
+- 遇到 `Claude Code 主计划、原始交付目标、P0 至 P6 阶段或 Ubuntu Compose 整合范围` 时，**必须**优先读取 `.context/architecture/project-handover.md` 中的主计划入口，并继续读取其指向的原计划文件。
+- 遇到 `个人干员池、个人装备池、库存透支、库存作用域、开局重抽或 P3 个人机变前置` 时，**必须**优先读取 `.context/architecture/personal-inventory.md`。
+- 遇到 `个人机变、choiceId 修订、重复策略、鸭爵来源、外勤医疗叠加或同格医疗设备` 时，**必须**优先读取 `.context/architecture/personal-sp-and-bands.md`。
+- 遇到 `扩展人数首领血池、十五个联防来源、四百条报告上限、UTF-8 信封预算或 b.resultFallback` 时，**必须**优先读取 `.context/architecture/large-party-accounting.md`。
+- 遇到 `第七至十六行战绩、selfId 缺本人误归属、稀疏席位开场结算、队友栏滚动或准备就绪换行` 时，**必须**优先读取 `.context/architecture/large-party-ui-and-stats.md`。
+- 遇到 `Compose 启动、固定素材初始化、SP_ASSET_BUNDLE_DIR、卷权限、维护排空、SP_DRAIN_FILE 或容器备份恢复` 时，**必须**优先读取 `.context/architecture/compose-and-assets.md`。
+- 遇到 `调配页 .lo-card 等待超时、默认卡片视图或账号切换旧选择器失败` 时，**必须**优先读取 `.context/pitfalls/loadout-deck-selector.md`。
+- 遇到 `源码提交、不提交测试、gitignore 对受跟踪文件无效、素材不入 Git 或用户手动部署` 时，**必须**优先读取 `.context/conventions/source-delivery.md`。

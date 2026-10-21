@@ -46,6 +46,14 @@ plugins/*
 !plugins/_template/
 
 # --- tests & logs ----------------------------------------------------------------------------------
+# 本次交付不纳入新增测试；已有受跟踪测试仍保留，提交时必须显式排除其修改。
+/test/
+**/*.test.*
+/tools/deploy/test-*.py
+/coverage/
+/test-results/
+/playwright-report/
+/.pytest_cache/
 test/e2e/out/
 logs/
 *.log
@@ -54,6 +62,29 @@ logs/
 scripts/service.env.cmd
 .env
 .env.*
+deploy/secrets/
+deploy/backups/
+# 私有账号状态、数据库旁文件和本地发行包不属于源码交付。
+/var/
+/state/
+/backups/
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.db-wal
+*.db-shm
+*.pem
+*.key
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.tgz
+*.tsbuildinfo
 
 # --- OS / editor clutter ---------------------------------------------------------------------------
 .DS_Store
@@ -63,5 +94,6 @@ desktop.ini
 .idea/
 .vscode/
 .claude/
+.codex/
 # tools/sim-check.mjs: the corpus and its Node traces for /dev/sim-check.html
 public/dev/simcheck/data/

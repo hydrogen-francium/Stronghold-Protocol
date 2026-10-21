@@ -21,6 +21,16 @@ cooldown. It respects the SFX/mute settings; a stale asynchronous decode cannot 
 All downloaded game assets the client needs are listed in **`data/assets.json`**. Game-art requests must use that manifest.
 The original project icons below are shipped static files, not downloaded game assets.
 
+The fork's `public/js/render/app/pixi.js` configures Pixi 7.4.2 with
+`Assets.setPreferences({ preferWorkers: false })` before texture loading in both preloaded and lazy setup paths.
+This disables its optional image-worker optimization, whose capability probe fetches a data URL incompatible with
+the unchanged site `connect-src 'self'`. Ordinary texture fetch/decode, image-bitmap support and load errors remain;
+no CSP permission or diagnostic exemption is added. Simulation, rehearsal and service workers are independent.
+A subsequent real-account PREP browser case passes unchanged field/canvas/shopbar geometry with zero unexpected
+diagnostics; the worker-probe CSP errors are absent. This is not complete texture/Spine/GPU acceptance, and the
+three-case text-scale suite also passes after separate achievement layout fixes, but DOM geometry and generated
+screenshots do not establish reliable pixel-level visual acceptance (AUTH.md §8).
+
 ## Original project application icons (#413)
 
 By the maintainer's revised decision of 2026-10-10, **沿用 0.2.x 的薄荷绿城堡并精修**.
@@ -776,7 +786,7 @@ The project's code is GPL-3.0-or-later (`LICENSE`); none of the items below is c
   - **Bender:** © Jovanny Lemonad (Oleg Zhuravlev, Ivan Gladkikh). Free for personal and commercial use.
   - **Novecento Wide:** © Jan Tonellato / Synthview. Free licence.
   - Both are mirrored from TimWangZi/The-font-of-Arknights.
-  - Noto Sans SC and Noto Serif SC (SIL OFL) are loaded from Google Fonts, not self-hosted.
+  - Noto Sans SC and Noto Serif SC are SIL OFL faces. Earlier upstream pages loaded Google Fonts; this fork's default game/UI gallery do not fetch a remote stylesheet or bundle new Noto files. They use the existing system CJK fallback stack (including a locally installed Noto face when available).
 
 ### Skill attack banks (0.2.3, PR #410)
 

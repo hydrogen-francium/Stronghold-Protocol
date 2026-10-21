@@ -8,6 +8,17 @@ Versions: the first public release was **0.1.0** (2026-10-02, the state of §0�
 
 ---
 
+**Fork-only deployment contract:** this tree intentionally adds durable server accounts, fail-closed HTTP/WS auth
+and one global 16-human Admission ledger. [AUTH.md](AUTH.md) is the current contract; [design/network.md](design/network.md)
+and [META.md](META.md) carry its lifecycle overrides, and [DEPLOY.md](DEPLOY.md) its operational requirements. These
+are not official-mode rules or features of the upstream 0.3.1 release; numbered upstream history stays intact, with
+a separate [fork appendix](history/0.3.1.md#fork-only-account-and-admission-integration). Fork protocol version 2
+supports co-op capacity 4/8/16 (default 4, `MAX_SEATS = 16`) and frozen actual-roster metadata. Personal operator /
+equipment pools above four players, related extended gameplay and auth-aware Compose remain incomplete; capacity
+support alone does not establish a playable >4-player full match. Foundational auth and multiple targeted
+HTTP/WS/Lobby/worker/client checks have execution evidence; [AUTH.md §8](AUTH.md#8-current-limits-and-verification-status)
+records the scope and remaining failures. These separate runs do not establish full CI, browser or deployment success.
+
 The 0.3.1 Forge integration/browser polish is [§34.27](history/0.3.1.md#3427-plugin-polish-after-the-end-to-end-checks):
 companion cosmetic hints, accurate import reports, record DSL permission checks and usable result panels (§32.8/§32.12).
 

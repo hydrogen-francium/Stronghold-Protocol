@@ -545,7 +545,10 @@ function StatsScreen({ tab }) {
       text: t('将删除本机保存的 {n} 条对局记录，无法恢复。', { n: stats.records.length }),
     });
     if (!ok) return;
-    if (!saveStats(emptyStats())) { try { globalThis.localStorage?.removeItem('sp.pref.stats'); } catch { /* ignore */ } }
+    if (!saveStats(emptyStats())) {
+      toast(t('无法写入本机存储，可能已满'), 'error');
+      return;
+    }
     reload();
     toast(t('已清空本机统计数据'), 'success');
   };

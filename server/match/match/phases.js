@@ -133,12 +133,9 @@ export class MatchPhases {
     });
   }
 
-  /**
-   * Whether `bandId` was already picked by another player of this draft. Research 09 §5 / DESIGN §14 corrections:
-   * the strategy draft marks a teammate's pick as 队友已选 and it cannot be chosen again (co-op). The automatic
-   * assignments — a turn that runs out and a departing seat — obey the same rule: see timeoutBand / defaultBand.
-   */
+  /** 判断其他玩家是否占用指定策略；超过四人的冻结规则允许重复，自动分配也走同一判定。 */
   bandTaken(bandId, playerId) {
+    if (this.runtimeContext.personalPools) return false;
     const picks = this.draft?.picks || {};
     for (const [pid, id] of Object.entries(picks)) if (pid !== playerId && id === bandId) return true;
     return false;

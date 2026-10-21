@@ -325,11 +325,12 @@ function ownedBonds(m, ps, exclude = null) {
  * left (what the shop can still bring soon — a teammate draining a bond, or a bond of high-tier members only, makes it
  * a poor target), `supply` = the copies left of all its members.
  */
+/** 根据指定玩家的所属普通池与已持有成员统计羁绊可达人数和余量，返回两份映射，不扣库存。 */
 function bondPoolStats(m, ps, owned) {
   const reach = new Map();
   const supply = new Map();
   const maxTier = Math.min(6, ps.shop.level + 1);
-  for (const [id, e] of m.pool.entries) {
+  for (const [id, e] of ps.chessPool.entries) {
     if (!(e.left > 0)) continue;
     const c = m.gd.chess(id);
     if (!c || !Array.isArray(c.bonds)) continue;
@@ -593,7 +594,7 @@ export function buyScoreOf(m, ps, id) {
   return buyScore(m, ps, id, context(m, ps));
 }
 
-/** Shop / reward score of acquiring one copy of chess `id` (0 = not worth it). */
+/** 按给定玩家与决策上下文为干员编号评分；个人池之间不争抢库存，不应用共享池让牌惩罚。 */
 function buyScore(m, ps, id, ctx) {
   const gd = ps?.gd || m.gd;
   const c = chessRec(m, id, ps);
@@ -621,10 +622,8 @@ function buyScore(m, ps, id, ctx) {
   if (ctx.model && !isHealer(c)) s += ARMOR_WEIGHT * 0.6 * (armorFit(ctx.model, c) - 0.6);
   // the player's own 自选 piece (a slotted slot: its composed record carries diyFor) — AI 托管 of a human with picks
   if (c.diyFor) s += DIY_PIECE_BONUS;
-  // [ASSUMED] A soft 18-point cooperation weight (PR #407), not an official rule or a reserved card.
-  // Leave high-tier shared chess to living teammates whose opening strategy needs its faction.
-  // Humans and bots count equally; a single soft penalty still allows valuable own merges.
-  if (c.tier >= 5 && !c.isGolden && !c.diyFor && m.pool.has(base) && m.alivePlayers().some((mate) =>
+  // [ASSUMED] 仅共享池沿用 PR #407 的十八分让牌惩罚；个人池无竞争，真人与托管均不应因此少买。
+  if (!m.runtimeContext.personalPools && c.tier >= 5 && !c.isGolden && !c.diyFor && ps.chessPool.has(base) && m.alivePlayers().some((mate) =>
     mate !== ps && gd.bandBondIds(mate.bandId).some((b) => !gd.modeInactiveBonds.has(b) && c.bonds.includes(b)))) s -= 18;
   return s;
 }
@@ -1302,15 +1301,16 @@ function copyCounts(m, ps) {
  * × MERGE_HIT, plus the keeper singles × PAIR_HIT. P = 1 − (1 − left / eligible copies)^chess slots — the shop's
  * copy-weighted roll over the shared pool's tiers ≤ shop level (PlayerState._rollChessSlot, pool.js roll).
  */
+/** 结合所属普通库存、现有对子与商店等级估算一次刷新的收益，返回评分，不实际刷新。 */
 function refreshValue(m, ps, ctx) {
   const L = ps.shop.level;
   let total = 0;
-  for (const e of m.pool.entries.values()) if (e.left > 0 && e.tier <= L) total += e.left;
+  for (const e of ps.chessPool.entries.values()) if (e.left > 0 && e.tier <= L) total += e.left;
   if (!(total > 0)) return 0;
   const slots = m.gd.shopSlots(L).chess;
   let v = 0;
   for (const [b, k] of ctx.copies) {
-    const e = m.pool.entries.get(b);
+    const e = ps.chessPool.entries.get(b);
     if (!e || e.left <= 0 || e.tier > L) continue;
     const pShop = 1 - (1 - e.left / total) ** slots;
     if (k + 1 >= mergeNeed(m, b)) v += pShop * MERGE_HIT;
@@ -1371,6 +1371,7 @@ function lineupGain(m, ps, id, ctx, cur) {
  * Prep start: sell bench chess that neither make the lineup nor build toward something (a pair that can still
  * merge, the focus bond, an elite) — they only block merges; the refund buys more. Keeps a few spare bench units.
  */
+/** 为指定玩家出售不进入阵容且无合成前景的替补；检查其普通或自选库存，并实际回收副本与资金。 */
 function sellJunk(m, ps) {
   const ctx = context(m, ps);
   const { bench } = chooseLineup(m, ps, ctx);
@@ -1382,7 +1383,7 @@ function sellJunk(m, ps) {
     const base = m.gd.baseIdOf(p.id);
     const copies = c.isGolden ? 0 : ctx.copies.get(base) || 0;
     // a pair whose third copy can still come (the merge's reward is worth it for any pair)
-    const pairLive = copies + 1 >= mergeNeed(m, base) && (m.pool.left(base) > 0 || !m.pool.has(base));
+    const pairLive = copies + 1 >= mergeNeed(m, base) && (ps.poolOf(base).left(base) > 0 || !ps.poolOf(base).has(base));
     const useful = c.isGolden || pairLive || ctx.keep.has(base) || (copies >= 2 && m.round <= 6);
     (useful ? keep : junk).push({ p, v: pieceValue(m, ps, p, ctx) + (pairLive ? 150 : useful ? 100 : 0) });
   }
@@ -1862,6 +1863,7 @@ function lastPerfect(m, ps) {
  *     items, GitHub #263); a bond signature item (requiresBondId): a member of that bond;
  *   other equipment: the strongest deployed damage dealers with a free slot (SURVIVAL items blockers first).
  */
+/** 按指定玩家的装备与决策上下文选择合法载体；拟态合成检查其所属库存，无合适目标返回空。 */
 export function itemTarget(m, ps, item, ctx = context(m, ps)) {
   const gd = ps?.gd || m.gd;
   const rec = gd.item(item.id);
@@ -1885,7 +1887,7 @@ export function itemTarget(m, ps, item, ctx = context(m, ps)) {
     case 'use_equip_reward_char_chess': {
       // with 2 copies owned and none left in the pool the item gives nothing (GitHub #207): such a pair is no carrier
       const counts = copyCounts(m, ps);
-      const live = (base) => { const pool = typeof ps.poolOf === 'function' ? ps.poolOf(base) : m.pool; return pool.left(base) > 0 || !pool.has(base); };
+      const live = (base) => { const pool = ps.poolOf(base); return pool.left(base) > 0 || !pool.has(base); };
       const dead = (p) => (counts.get(gd.baseIdOf(p.id)) || 0) >= 2 && !live(gd.baseIdOf(p.id));
       const pair = owned.filter((p) => normal(p) && !dead(p) && (counts.get(gd.baseIdOf(p.id)) || 0) + 1 >= mergeNeed(m, gd.baseIdOf(p.id)))
         .sort((a, b) => (chessRec(m, b.id, ps)?.tier || 0) - (chessRec(m, a.id, ps)?.tier || 0) || a.uid - b.uid);

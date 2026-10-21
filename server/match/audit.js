@@ -47,6 +47,7 @@ import { mergeTile, pieceDir, canPlace, placeClass } from './board.js';
 import { bossPoolHp, hiddenEligible } from './finalAssault.js';
 import { helperOrder } from './unite.js';
 import { BAND_TURN_SECONDS } from './Match.js';
+import { draftCardCount } from './choices.js';
 
 /**
  * @param {import('./Match.js').Match} m
@@ -130,7 +131,7 @@ export function attachAudit(m, { invariants = true, limit = 200 } = {}) {
           if (t > ps.shop.level) fail(`${ps.playerId}: rolled tier ${t} at shop level ${ps.shop.level}`);
           // (a slotted 自选 piece comes from the player's own stock, 0.2.0 player/diy.js — once the 调度中心 is at its level)
           const diy = ps.diyStock && ps.diyStock.has(base) ? ps.diyStock.entries.get(base) : null;
-          if (!m.pool.has(base) && !diy) fail(`${ps.playerId}: rolled ${s.id} outside the match pool (banned/hidden)`);
+          if (!ps.chessPool.has(base) && !diy) fail(`${ps.playerId}: rolled ${s.id} outside the match pool (banned/hidden)`);
           if (diy && ps.shop.level < diy.shopLevel) fail(`${ps.playerId}: rolled 自选 ${s.id} at shop level ${ps.shop.level} < ${diy.shopLevel}`);
           if (s.basePrice !== gd.chessPrice(s.id)) fail(`${ps.playerId}: ${s.id} basePrice ${s.basePrice} != ${gd.chessPrice(s.id)}`);
         });
@@ -345,13 +346,16 @@ export function attachAudit(m, { invariants = true, limit = 200 } = {}) {
     const s = m.sp;
     if (m.phase === PHASE.SP_DRAFT && s) check('sp draft', () => {
       const alive = m.alivePlayers().map((p) => p.playerId);
-      const want = m.isSolo ? 3 : 6;
-      if (s.cards.length > want) fail(`${s.cards.length} 机变 cards (max ${want})`);
-      if (s.order.length !== alive.length) fail(`机变 order ${s.order.length} for ${alive.length} alive`);
+      const want = draftCardCount(gd, m.round);
+      if (!s.personal && s.cards.length > want) fail(`${s.cards.length} 机变 cards (max ${want})`);
+      if (alive.some((pid) => !s.order.includes(pid))) fail('机变遗漏存活玩家');
       for (const pid of alive) {
         const idx = s.picks[pid];
         if (idx == null) fail(`${pid} ends 机变 without a card`);
-        else if (s.taken[idx] !== pid) fail(`${pid} picked card ${idx} held by ${s.taken[idx]}`);
+        else if (s.personal) {
+          const deck = s.decks.get(pid);
+          if (!deck || deck.cards.length !== want || !deck.cards[idx]) fail(`${pid} 个人机变候选或选择无效`);
+        } else if (s.taken[idx] !== pid) fail(`${pid} picked card ${idx} held by ${s.taken[idx]}`);
       }
       const holders = Object.values(s.taken);
       if (new Set(holders).size !== holders.length) fail('a player took two 机变 cards');

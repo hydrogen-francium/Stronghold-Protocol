@@ -490,6 +490,7 @@ function grantSpeaker(gd, source) {
  * @param {string} hook
  * @param {object|null} [ev] the event being dispatched (onPrice: ctx.modifyPrice / ctx.setPrice edit ev.price)
  */
+/** 为给定玩家、效果来源与钩子建立效果接口；抽取读取该玩家库存，发奖等操作会修改其状态。 */
 export function makeCtx(m, ps, source, hook, ev = null, preview = null) {
   // the player's view of the data: its slotted 自选 slots are its operators (0.2.0, player/diy.js) — chessRecord,
   // pieceBonds, a strategy's / 特质's bond and tier reads see the operator; the match's GameData for everyone else
@@ -518,6 +519,7 @@ export function makeCtx(m, ps, source, hook, ev = null, preview = null) {
     difficulty: m.difficulty,
     isSolo: m.isSolo,
     isCoop: !m.isSolo,
+    personalPools: m.runtimeContext.personalPools,
     data: gd.raw,
     gd,
     rng,
@@ -529,6 +531,8 @@ export function makeCtx(m, ps, source, hook, ev = null, preview = null) {
     alive: () => ps.alive,
     bandId: () => ps.bandId,
     teamMedicGranted: () => m.teamMedicGranted(),
+    /** 读取医疗团队效果的逐持有人来源，供战斗输入保留逻辑实例。 */
+    teamMedicSources: () => m.teamMedicSources(),
     shopLevel: () => ps.shop.level,
     bond: (id) => (ps.bonds[id] ? { ...ps.bonds[id] } : null),
     bonds: () => Object.fromEntries(Object.entries(ps.bonds).map(([k, v]) => [k, { ...v }])),
@@ -601,7 +605,8 @@ export function makeCtx(m, ps, source, hook, ev = null, preview = null) {
       const base = gd.baseIdOf(id);
       // "some effects fail when the cap is hit" (research 06 §7): by default a chess of the pool needs a free copy (a
       // 自选 piece: one of the player's own stock — player/diy.js poolOf)
-      const pool = typeof ps.poolOf === 'function' ? ps.poolOf(base) : m.pool;
+      // 来源只决定效果展示，实际扣账始终属于接收玩家及其自选库存。
+      const pool = ps.poolOf(base);
       if (opts.requirePool !== false && pool.has(base) && pool.left(base) < 1) return null;
       const p = ps.acquireChess(id, { source: opts.source || source.key || 'effect', toTemp: !!opts.toTemp, fromPool: opts.fromPool !== false });
       // 「歌蕾蒂娅：获得斯卡蒂」 — every silent grantChess (a 特质, 余 SERVER_MOST_BOND, a band, an item, a choice).
@@ -637,9 +642,10 @@ export function makeCtx(m, ps, source, hook, ev = null, preview = null) {
         return typeof opts.filter === 'function' ? !!opts.filter(id) : true;
       };
       const extra = typeof ps.diyStockEntries === 'function' ? ps.diyStockEntries() : null;
-      return m.pool.roll(rng, { maxTier: Number.isInteger(opts.maxTier) ? opts.maxTier : 6, tier: Number.isInteger(opts.tier) ? opts.tier : null, filter: f, extra, ignoreCounts: opts.ignoreCounts === true });
+      return ps.chessPool.roll(rng, { maxTier: Number.isInteger(opts.maxTier) ? opts.maxTier : 6, tier: Number.isInteger(opts.tier) ? opts.tier : null, filter: f, extra, ignoreCounts: opts.ignoreCounts === true });
     },
-    rollItem: (opts = {}) => rolls.rollItemId(opts),
+    /** 按筛选参数抽装备编号；接收者由当前接口固定，调用方不能覆写为其他玩家。 */
+    rollItem: (opts = {}) => rolls.rollItemId({ ...opts, player: ps }),
     /**
      * Roll a choices.json pool: equip pools → { kind: 'item', id }; chess pools (items / weighted / shopEligible with
      * tier, minTier, bond, golden) → { kind: 'chess', id, golden } (a pool chess needs a free copy). null when empty.
@@ -649,6 +655,7 @@ export function makeCtx(m, ps, source, hook, ev = null, preview = null) {
       // a shared-pool draw also takes the player's 自选 stock, its bonds read through the player's view (rollChess)
       extra: typeof ps.diyStockEntries === 'function' ? ps.diyStockEntries() : null, chessOf: (id) => gd.chess(id),
       ...opts,
+      player: ps,
     }),
     /**
      * Run another owned chess's 特质 of `eventType` now (SERVER_GAIN / SERVER_PREP_START / SERVER_PREP_FIN /

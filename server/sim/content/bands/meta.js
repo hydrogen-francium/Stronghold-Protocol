@@ -425,7 +425,7 @@ function duckParams(bandId = DUCK_BAND) {
  * Rewrite `spawns` in place (exported for tests). Returns the replaced spawn specs. `side` ('L' | 'R', a pair boss
  * field) limits the swap to the spawns whose route (`routes[routeIndex]`) ends on that half of the field.
  */
-export function duckReplace(ctx, spawns, p, ownerPlayerId, { routes = null, side = null } = {}) {
+export function duckReplace(ctx, spawns, p, ownerPlayerId, { routes = null, side = null, bandSource = null } = {}) {
   const gd = ctx.gd;
   const ducks = list(p.enemylist).filter((k) => gd.enemy(k));
   if (!ducks.length || !Array.isArray(spawns)) return [];
@@ -471,7 +471,7 @@ export function duckReplace(ctx, spawns, p, ownerPlayerId, { routes = null, side
       const d = {
         ...s, mods: s.mods ? { ...s.mods } : undefined, count: 1, interval: 0,
         time: num(s.time, 0) + k * num(s.interval, 0), enemyKey: ctx.rng.pick(ducks), tag: 'duck',
-        bounty: { coins: DUCK_COINS, ownerPlayerId },
+        bounty: { coins: DUCK_COINS, ownerPlayerId, ...(bandSource ? { bandSource } : {}) },
       };
       if (d.mods) delete d.mods.slot;
       add.push(d);
@@ -492,13 +492,19 @@ export function duckReplace(ctx, spawns, p, ownerPlayerId, { routes = null, side
 }
 
 const duckGlobal = {
+  /** 对当前目标波次逐持有人施加一次替换；赏金归属不因策略来源改变。 */
   onBattleStart(ctx, ev) {
     if (!ev || !DUCK_KINDS.has(ev.kind) || !Array.isArray(ev.spawns)) return;
-    const holder = [ctx, ...ctx.teammates()].find(t => (t.gd.band(t.bandId())?.effectRef ?? t.bandId()) === DUCK_BAND);
-    if (!holder) return;
-    const p = duckParams(holder.bandId());
-    if (!p || ctx.round < int(p.round, 1)) return;
-    duckReplace(ctx, ev.spawns, p, ctx.playerId, { routes: ev.routes, side: ev.side });
+    const holders = [ctx, ...ctx.teammates()].filter(t => (t.gd.band(t.bandId())?.effectRef ?? t.bandId()) === DUCK_BAND);
+    // 原四人规则只存在一个有效持有人，保留首个来源及原随机数消耗。
+    for (const holder of ctx.personalPools ? holders : holders.slice(0, 1)) {
+      const p = duckParams(holder.bandId());
+      if (!p || ctx.round < int(p.round, 1)) continue;
+      duckReplace(ctx, ev.spawns, p, ctx.playerId, {
+        routes: ev.routes, side: ev.side,
+        bandSource: ctx.personalPools ? { playerId: holder.playerId, bandId: holder.bandId() } : null,
+      });
+    }
   },
 };
 

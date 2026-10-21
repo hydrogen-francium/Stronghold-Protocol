@@ -1588,7 +1588,8 @@ export class UnitView {
     const s = p.s;
     // fades
     if (this.fadeIn < 1) this.fadeIn = Math.min(1, this.fadeIn + dt * 4);
-    let alpha = this.fadeIn;
+    // A queued 联防 arrival hides the view without changing Start / landing or animation clocks.
+    let alpha = this._beamLeft > 0 ? 0 : this.fadeIn;
     if (this.down) {
       // knocked down: the Die clip ends and holds its last frame (the actor keeps its clock), no fade
       this.dieT += dt;

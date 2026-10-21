@@ -1,21 +1,11 @@
-# syntax=docker/dockerfile:1
 # 卫戍协议：盟约 · production image (server + static client). Docs: docs/DEPLOY.md「Docker」.
 #
-# Code: GPL-3.0-or-later (LICENSE). Game art/audio is © Hypergryph / Yostar, not covered by the GPL, non-commercial use
-# only (NOTICE.md), and never part of the repository. Two ways to get it into a container:
-#   A) download it while building (~250 MB, needs internet during the build):
-#        docker build -t stronghold-protocol --build-arg FETCH_ASSETS=1 .
-#   B) build without it and mount the host's copy (prepared with `node tools/setup.mjs` on the host):
-#        docker build -t stronghold-protocol .
-#        docker run -d --name stronghold -p 3000:3000 --restart unless-stopped \
-#          -v "$PWD/public/assets:/app/public/assets:ro" stronghold-protocol
-#      (public/fonts, data/assets.json, data/local-assets.json and data/local-fx.json are copied from the build context when present)
-# Without any art the game still runs with placeholder visuals.
-#
-# Run:  docker run -d --name stronghold -p 3000:3000 --restart unless-stopped stronghold-protocol
-# Env:  PORT (3000), HOST (0.0.0.0), SP_COMBAT (client|server), SP_VERIFY (off|sample|all), TRUST_PROXY (auto|1|0), DEBUG
+# 代码许可见 LICENSE；游戏素材不属于 GPL，版权及非商用限制见 NOTICE.md。
+# 正式入口使用 compose.yaml；素材由独立初始化服务校验后只读挂载。
+# 不再提供警告后继续的构建期素材下载，认证参数缺失仍由应用启动检查拒绝。
+# 部署、迁移、维护与备份步骤见 docs/COMPOSE.md。
 
-ARG NODE_IMAGE=node:22-alpine
+ARG NODE_IMAGE=node:24.14.1-bookworm-slim@sha256:b506e7321f176aae77317f99d67a24b272c1f09f1d10f1761f2773447d8da26c
 
 # ---- 1. production dependencies (cached while package*.json are unchanged) -------------------------
 FROM ${NODE_IMAGE} AS deps
@@ -24,9 +14,8 @@ COPY package.json package-lock.json ./
 # --ignore-scripts: the postinstall (tools/vendor.mjs) runs in the next stage, once the sources are there
 RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund && npm cache clean --force
 
-# ---- 2. vendor libs + optional art download ---------------------------------------------------------
+# ---- 2. 构建浏览器依赖；正式素材由独立初始化服务校验，不能警告后带缺失素材上线。 ----
 FROM deps AS build
-ARG FETCH_ASSETS=0
 COPY shared ./shared
 COPY server ./server
 COPY tools ./tools
@@ -37,11 +26,7 @@ COPY schemas ./schemas
 COPY test/helpers/battleHarness.js ./test/helpers/battleHarness.js
 COPY docs/PLUGIN*.md docs/plugin-catalog.example.json ./docs/
 COPY docs/research ./docs/research
-RUN node tools/vendor.mjs \
- && if [ "$FETCH_ASSETS" = "1" ]; then \
-      node tools/fetch-assets.mjs || echo "WARNING: art download incomplete; the image falls back to placeholder art"; \
-    fi \
- && rm -rf .cache
+RUN node tools/vendor.mjs && rm -rf .cache
 
 # ---- 3. runtime ---------------------------------------------------------------------------------------
 FROM ${NODE_IMAGE}
@@ -51,6 +36,8 @@ ENV NODE_ENV=production \
     SP_PLUGIN_RESOURCES=/app/plugin-resources
 WORKDIR /app
 COPY --from=deps /app/package.json ./package.json
+# 运行镜像同样属于代码分发，必须保留项目和第三方许可声明。
+COPY LICENSE NOTICE.md THIRD-PARTY-NOTICES.md ./
 COPY --from=deps /app/node_modules ./node_modules
 COPY --from=build /app/shared ./shared
 COPY --from=build /app/server ./server
@@ -59,17 +46,18 @@ COPY --from=build /app/public ./public
 # the Spine and atlas parsers the plugin packer and the plugin studio use (server/plugins/pack.js, server/studio/)
 COPY --from=build /app/tools/assets ./tools/assets
 COPY --from=build /app/tools/plugin.mjs ./tools/plugin.mjs
+COPY --from=build /app/tools/deploy/control.mjs ./tools/deploy/control.mjs
 COPY --from=build /app/test/helpers/battleHarness.js ./test/helpers/battleHarness.js
 COPY --from=build /app/schemas ./schemas
 COPY --from=build /app/docs/PLUGIN*.md /app/docs/plugin-catalog.example.json ./docs/
 # Root-owned templates and author guides remain visible when /app/plugins is a bind mount or named volume.
 COPY --from=build /app/plugin-resources ./plugin-resources
-RUN mkdir -p /app/plugins && chown node:node /app/plugins
+RUN mkdir -p /app/plugins /app/.cache /srv/state && chown node:node /app/plugins /app/.cache /srv/state && chmod 0700 /srv/state
 # research tables: read by server/sim/nodeData.js as a fallback
 COPY --from=build /app/docs/research ./docs/research
 
 USER node
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-  CMD wget -q -O /dev/null "http://127.0.0.1:${PORT}/healthz" || exit 1
+  CMD ["node", "--input-type=module", "-e", "const r = await fetch(`http://127.0.0.1:${process.env.PORT}/healthz`); if (!r.ok || (await r.json()).ok !== true) process.exit(1)"]
 CMD ["node", "server/index.js"]

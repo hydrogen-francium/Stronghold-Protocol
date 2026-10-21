@@ -21,7 +21,7 @@
 // shallow-merges into one nested object. Subscribers are notified synchronously.
 
 import { useLayoutEffect, useReducer, useRef } from '../vendor/hooks.module.js';
-import { PHASE } from '../../shared/constants.js';
+import { PHASE, DEFAULT_SEATS, ROOM_CAPACITIES } from '../../shared/constants.js';
 import { t } from '../../shared/i18n.js';
 
 /**
@@ -74,6 +74,14 @@ export function createStore(initial) {
 /** Fresh (empty) match slice. */
 export const emptyMatch = () => ({ public: null, private: null, field: null, result: null, battle: null });
 
+/** Capacity controls require the connected server's advertised contract, not just this client's constants. */
+export function roomCapacityOptions(info) {
+  if (info?.version !== 1 || info.default !== DEFAULT_SEATS || !ROOM_CAPACITIES.includes(info.max)
+    || !Array.isArray(info.supported)) return [];
+  const values = ROOM_CAPACITIES.filter((n) => n <= info.max && info.supported.includes(n));
+  return values.includes(DEFAULT_SEATS) ? values : [];
+}
+
 /** Initial app state (exported for tests and resets). */
 export const initialState = Object.freeze({
   connection: { status: 'idle', ping: null, attempt: 0, retryAt: 0, lastError: null, everOnline: false },
@@ -87,6 +95,7 @@ export const initialState = Object.freeze({
   room: null,
   // welcome.testMode (DESIGN §34.8). The server omits the key when the switch is off; the client cannot set it.
   testMode: false,
+  roomCapacities: [],
   match: emptyMatch(),
   ticker: [],
   emotes: [],
@@ -95,7 +104,7 @@ export const initialState = Object.freeze({
 });
 
 /** The app-wide store singleton. */
-export const store = createStore(initialState);
+export const store = Object.assign(createStore(initialState), { prefStorageKey });
 
 /**
  * Which screen the router shows for a given app state:
@@ -165,31 +174,52 @@ export function shallowEqual(a, b) {
   return true;
 }
 
-// ---- tiny persisted preferences (localStorage, failure-tolerant) --------------------------------
+// ---- persisted preferences: device conveniences or a verified account namespace -----------------
 
-/**
- * Read a JSON preference from localStorage.
- * @template T
- * @param {string} key
- * @param {T} fallback
- * @returns {T}
- */
+const ACCOUNT_ID = /^a_[0-9a-f]{32}$/;
+// Everything else defaults to account-only. Never migrate an unscoped guest preference by nickname.
+const DEVICE_PREFS = new Set(['lang', 'screenFit', 'hub.backdrop']);
+let preferenceAccountId = null;
+let documentAccountId = null;
+
+/** Bind before importing modules that initialise their preference stores. Changing users requires a new document. */
+export function setAccountScope(accountId) {
+  if (accountId == null) { preferenceAccountId = null; return; }
+  if (typeof accountId !== 'string' || !ACCOUNT_ID.test(accountId)) throw new Error('Invalid account scope');
+  if (documentAccountId && documentAccountId !== accountId) throw new Error('Account changes require a page reload');
+  documentAccountId = accountId;
+  preferenceAccountId = accountId;
+}
+
+export const getAccountScope = () => preferenceAccountId;
+
+/** null means fail closed: the caller must neither read nor write a guest/device fallback. */
+export function prefStorageKey(key) {
+  if (typeof key !== 'string' || !key || key.length > 160) return null;
+  if (DEVICE_PREFS.has(key)) return `sp.pref.${key}`;
+  return preferenceAccountId ? `sp.account.${preferenceAccountId}.pref.${key}` : null;
+}
+
+// Compatibility for UI modules that receive the singleton rather than the helper directly.
+store.prefStorageKey = prefStorageKey;
+
+/** Read JSON from this account's local cache (not a cloud account record). */
 export function loadPref(key, fallback) {
+  const fullKey = prefStorageKey(key);
+  if (!fullKey) return fallback;
   try {
-    const raw = globalThis.localStorage?.getItem(`sp.pref.${key}`);
+    const raw = globalThis.localStorage?.getItem(fullKey);
     return raw == null ? fallback : JSON.parse(raw);
   } catch {
     return fallback;
   }
 }
 
-/**
- * Write a JSON preference to localStorage (silently ignores quota/privacy errors).
- * @param {string} key
- * @param {any} value
- */
+/** Ignore quota/privacy failures and all account writes while no verified scope is bound. */
 export function savePref(key, value) {
-  try { globalThis.localStorage?.setItem(`sp.pref.${key}`, JSON.stringify(value)); } catch { /* ignore */ }
+  const fullKey = prefStorageKey(key);
+  if (!fullKey) return;
+  try { globalThis.localStorage?.setItem(fullKey, JSON.stringify(value)); } catch { /* ignore */ }
 }
 
 const identity = (s) => s;

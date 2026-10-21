@@ -42,6 +42,12 @@
 .pboot__card--r { flex-direction: row-reverse; background: linear-gradient(270deg, rgba(63, 214, 180, .78), rgba(63, 214, 180, .95)); --from: calc(60 * var(--px)); }
 .pboot__card--l { --from: calc(-60 * var(--px)); }
 .pboot__card--c { --from: 0px; }
+/* 扩展人数保留所有卡片并压缩行高，十六人也不覆盖下方标题。 */
+.pboot--dense .pboot__card { height: calc(62 * var(--px)); }
+.pboot--dense .pboot__face { width: calc(54 * var(--px)); height: calc(54 * var(--px)); }
+.pboot--dense .pboot__num { font-size: calc(28 * var(--px)); }
+.pboot--dense .pboot__done { font-size: calc(12 * var(--px)); }
+.pboot--dense .pboot__check { width: calc(16 * var(--px)); height: calc(16 * var(--px)); margin-top: calc(2 * var(--px)); }
 /* a solo run: the one card under the ring, the words lower (the footage, video 7:50) */
 .pboot--solo .pboot__title { top: calc(805 * var(--px)); }
 .pboot--solo .pboot__sub { top: calc(938 * var(--px)); }

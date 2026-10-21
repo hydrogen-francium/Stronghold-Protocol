@@ -1,0 +1,14 @@
+{
+    email {$ACME_EMAIL}
+    admin off
+}
+
+{$SP_DOMAIN} {
+    encode zstd gzip
+    reverse_proxy app:3000 {
+        # 入口只有该反代；始终用真实直连地址覆盖伪造的转发头。
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Real-IP {remote_host}
+        header_up -CF-Connecting-IP
+    }
+}

@@ -1,7 +1,7 @@
 // server/net.js — WebSocket session layer (DESIGN §1, §8).
 //
 // Responsibilities:
-//   * Session objects (playerId, secret reconnect token, name, bound socket, connection state) and the
+//   * Session objects (playerId, secret reconnect token, accountId, name, bound socket, connection state) and the
 //     SessionRegistry that resolves reconnect tokens and expires sessions after the reconnect window (10 min; the
 //     lobby may extend it per session via `session.resumeWindowMs` — a solo run: 24 h, see server/lobby.js).
 //   * Per-connection pipeline: token-bucket rate limit (40 msg/s) → JSON decode → schema validation
@@ -16,26 +16,31 @@
 //     (`maxConnectionsPerAddr`, checked at upgrade time through `admission`), rooms and running matches
 //     in server/lobby.js. Local / LAN peers without a forwarding header (dev machine, tests, LAN party)
 //     have no key and are never limited per address.
+//   * Optional AuthService (null only for standalone legacy components): the upgrade's server-issued identity is
+//     revalidated at adoption, every frame/pong, heartbeat, and deferred request execution. Reconnect tokens identify
+//     a game session only; authenticated sessions belong to one account and require explicit live takeover.
 //   * Heartbeat (ws ping/pong every `heartbeatMs`, dead sockets terminated), hello timeout.
 //   * Send helpers that never throw, with a backpressure guard: non-critical `b.snap` frames are skipped
 //     while the socket has more than 1 MB queued; a socket with more than 16 MB queued is terminated
 //     (the client reconnects and receives a full state resync).
 //
-// Close codes used by the server (clients should NOT auto-reconnect on 4001):
+// Close codes used by the server (clients should NOT auto-reconnect on 4001 / 4003):
 //   4001 session replaced (the same token connected from another socket/tab)
 //   4002 hello timeout
+//   4003 authentication required (expired / revoked / disabled identity; never auto-reconnect)
 //   1008 abusive flooding (rate-limit drops > abuseDropsPerSec)
 //   1001 server shutdown
 //
 // The handler object (implemented by server/lobby.js) receives:
-//   onHello(session, { resumed, repeat })  after `welcome` was sent
+//   onHello(session, { resumed, repeat, isCurrent })  after `welcome` was sent
 //   welcomeInfo() → object (optional)      extra fields of every `welcome` (never one of its own keys): the lobby's
 //                                          `diyKitted` (0.2.0 自选编队 — which operators a DIY slot may field) and
 //                                          `content` ({ vanilla: <cs> }, the server's content hash — DESIGN §32)
-//   onMessage(session, msg) → { ok: true } | { error: ERR code, detail?: string } | undefined — or a Promise of one
+//   onMessage(session, msg, { isCurrent }) → { ok: true } | { error: ERR code, detail?: string } | undefined — or a Promise of one
 //                                          (a room whose match runs in a match host worker, DESIGN §32.6: the reply
-//                                          goes out when it settles; a rejection is INTERNAL)
-//   routeGame(session, msg) → same (optional): client-side combat reports `b.progress` / `b.result` (DESIGN §14) go
+//                                          goes out when it settles; a rejection is INTERNAL). Queued work MUST call
+//                                          isCurrent() immediately before execution and after awaits before mutation.
+//   routeGame(session, msg, { isCurrent }) → same (optional): client-side combat reports `b.progress` / `b.result` (DESIGN §14) go
 //                                          straight to the running match through it; without it they reach onMessage
 //   onDisconnect(session)                  the session's socket closed (session kept for the reconnect window)
 //   onExpire(session)                      the session was purged (disconnected longer than the window)
@@ -75,7 +80,7 @@ export const NET_DEFAULTS = Object.freeze({
 export const HEAVY_TYPES = new Set(['g.watch', 'room.loadout', 'room.ownership', 'room.diy', 'room.spectate', 'room.setPlugins', 'room.skins']);
 
 /** Close codes (see header). */
-export const CLOSE = Object.freeze({ REPLACED: 4001, HELLO_TIMEOUT: 4002, POLICY: 1008, SHUTDOWN: 1001 });
+export const CLOSE = Object.freeze({ REPLACED: 4001, HELLO_TIMEOUT: 4002, AUTH_REQUIRED: 4003, POLICY: 1008, SHUTDOWN: 1001 });
 
 const WS_OPEN = 1;
 const MAX_RID = 2 ** 31;
@@ -88,11 +93,13 @@ const noopLog = { info() {}, warn() {}, error() {}, debug() {} };
 /** One logical player identity; survives socket reconnects for the reconnect window. */
 export class Session {
   /**
-   * @param {{ playerId: string, token: string, name: string, now?: number }} init
+   * @param {{ playerId: string, token: string, name: string, accountId?: string | null, now?: number }} init
    */
-  constructor({ playerId, token, name, now = Date.now() }) {
+  constructor({ playerId, token, name, accountId = null, now = Date.now() }) {
     /** @type {string} public id, shared with other players */
     this.playerId = playerId;
+    /** @type {string | null} server-authenticated account binding (never read from a client message) */
+    this.accountId = accountId;
     /** @type {string} secret 128-bit hex reconnect token (only ever sent to its owner) */
     this.token = token;
     /** @type {string} sanitized nickname */
@@ -141,7 +148,7 @@ export class Session {
 /** Random 128-bit hex token. */
 export const newToken = () => randomBytes(16).toString('hex');
 
-/** Registry of sessions by playerId and by token; purges sessions disconnected longer than the window. */
+/** Registry of sessions by playerId, reconnect token and account; at most one retained session per account. */
 export class SessionRegistry {
   /**
    * @param {{ reconnectWindowMs?: number, maxSessions?: number, now?: () => number }} [opts]
@@ -152,25 +159,31 @@ export class SessionRegistry {
     this.now = now;
     /** @type {Map<string, Session>} */ this.byPlayerId = new Map();
     /** @type {Map<string, Session>} */ this.byTokenMap = new Map();
+    /** @type {Map<string, Session>} */ this.byAccountMap = new Map();
   }
 
   get size() { return this.byPlayerId.size; }
 
   /**
    * Create a new session with a fresh playerId and token. Evicts the oldest idle (disconnected, roomless)
-   * session when the registry is full. Returns null when full of active sessions.
+   * session when the registry is full, except expired account sessions awaiting sweep. Returns null when full or
+   * an account already has a retained session, even if expired: only sweep may remove that expired session so
+   * Network can deliver its onExpire callback.
    * @param {string} name
+   * @param {string | null} [accountId] trusted server-side account binding
    * @returns {Session | null}
    */
-  create(name) {
+  create(name, accountId = null) {
+    if (accountId !== null && (typeof accountId !== 'string' || !accountId || this.byAccountMap.has(accountId))) return null;
     if (this.byPlayerId.size >= this.maxSessions && !this.evictOne()) return null;
     let playerId;
     do playerId = 'p_' + randomBytes(5).toString('hex'); while (this.byPlayerId.has(playerId));
     let token;
     do token = newToken(); while (this.byTokenMap.has(token));
-    const s = new Session({ playerId, token, name, now: this.now() });
+    const s = new Session({ playerId, token, name, accountId, now: this.now() });
     this.byPlayerId.set(playerId, s);
     this.byTokenMap.set(token, s);
+    if (accountId !== null) this.byAccountMap.set(accountId, s);
     return s;
   }
 
@@ -183,6 +196,13 @@ export class SessionRegistry {
     return s;
   }
 
+  /** @param {unknown} accountId @returns {Session | null} only a live, non-expired account session */
+  byAccount(accountId) {
+    if (typeof accountId !== 'string' || !accountId) return null;
+    const s = this.byAccountMap.get(accountId);
+    return s && !this.isExpired(s, this.now()) ? s : null;
+  }
+
   /** @param {string} playerId @returns {Session | null} */
   byId(playerId) { return this.byPlayerId.get(playerId) || null; }
 
@@ -190,6 +210,7 @@ export class SessionRegistry {
   remove(s) {
     if (this.byPlayerId.get(s.playerId) === s) this.byPlayerId.delete(s.playerId);
     if (this.byTokenMap.get(s.token) === s) this.byTokenMap.delete(s.token);
+    if (this.byAccountMap.get(s.accountId) === s) this.byAccountMap.delete(s.accountId);
   }
 
   /**
@@ -219,10 +240,14 @@ export class SessionRegistry {
     return out;
   }
 
-  /** Evict the oldest disconnected session that is not in a room. @returns {boolean} */
+  /** Evict an idle roomless session, leaving expired account sessions for sweep/onExpire. @returns {boolean} */
   evictOne() {
+    const now = this.now();
     for (const s of this.byPlayerId.values()) {
-      if (!s.connected && !s.roomCode) { this.remove(s); return true; }
+      if (!s.connected && !s.roomCode && (s.accountId === null || !this.isExpired(s, now))) {
+        this.remove(s);
+        return true;
+      }
     }
     return false;
   }
@@ -482,11 +507,20 @@ export function clientAddress(req, trustProxy = NET_DEFAULTS.trustProxy) {
 // Network: per-socket pipeline
 // ---------------------------------------------------------------------------------------------------
 
+/** Copy only the authenticated account's public fields, never authentication/session digests. */
+function accountView(identity) {
+  const account = identity?.account;
+  return account ? { id: account.id, username: account.username, name: account.name, tag: account.tag, local: false } : null;
+}
+
 /** Per-socket state. */
 class Connection {
-  /** @param {import('ws').WebSocket} ws @param {{ ip: string, key: string | null }} addr @param {number} now @param {typeof NET_DEFAULTS} opts */
-  constructor(ws, addr, now, opts) {
+  /** @param {import('ws').WebSocket} ws @param {{ ip: string, key: string | null }} addr @param {number} now @param {typeof NET_DEFAULTS} opts @param {object | null} identity */
+  constructor(ws, addr, now, opts, identity = null) {
     this.ws = ws;
+    // Trusted upgrade metadata only. Copy/freeze it so later mutations cannot change this socket's identity.
+    this.identity = identity && typeof identity === 'object'
+      ? Object.freeze({ ...identity, account: Object.freeze(accountView(identity) || {}) }) : null;
     this.ip = addr.ip;
     /** @type {string | null} per-network limit key (see clientAddress) */
     this.key = addr.key;
@@ -507,6 +541,12 @@ class Connection {
     this.closing = true;
     try { this.ws.close(code, reason); } catch { /* ignore */ }
   }
+
+  /** Termination also invalidates already queued work before the socket's close event arrives. */
+  terminate() {
+    this.closing = true;
+    try { this.ws.terminate(); } catch { /* ignore */ }
+  }
 }
 
 /** Frames larger than this are not parsed just to echo a rid on a RATE error (CPU guard). */
@@ -517,15 +557,18 @@ export class Network {
   /**
    * @param {{
    *   registry: SessionRegistry,
-   *   handler: { onHello?: Function, onMessage: Function, onDisconnect?: Function, onExpire?: Function, welcomeInfo?: Function },
+   *   handler: { onHello?: Function, onMessage: Function, routeGame?: Function, onDisconnect?: Function, onExpire?: Function, welcomeInfo?: Function },
+   *   auth?: { validateIdentity: (identity: any) => boolean } | null,
    *   log?: { info: Function, warn: Function, error: Function, debug?: Function },
    *   now?: () => number,
    *   options?: Partial<typeof NET_DEFAULTS>,
    * }} opts
    */
-  constructor({ registry, handler, log = noopLog, now = Date.now, options = {} }) {
+  constructor({ registry, handler, auth = null, log = noopLog, now = Date.now, options = {} }) {
     this.registry = registry;
     this.handler = handler;
+    // Null preserves independently constructed legacy components; production startServer always supplies AuthService.
+    this.auth = auth;
     this.log = log;
     this.now = now;
     this.opts = { ...NET_DEFAULTS, ...options };
@@ -544,6 +587,67 @@ export class Network {
   /** Number of open sockets. */
   get connectionCount() { return this.conns.size; }
 
+  /** Fail closed; revocation does not release the account's retained game session or room seat. */
+  requireAuth(conn, rid) {
+    if (!conn.closing) {
+      this.reply(conn, errorMsg(ERR.AUTH_REQUIRED, rid));
+      conn.close(CLOSE.AUTH_REQUIRED, 'AUTH_REQUIRED');
+    }
+    return false;
+  }
+
+  /** The upgrade may have raced logout, gate expiry or an external account disable. Never cache a successful check. */
+  authenticated(conn, rid) {
+    if (this.auth === null) return true;
+    const identity = conn.identity;
+    try {
+      if (identity && typeof identity.accountId === 'string' && identity.accountId
+        && typeof identity.tokenHash === 'string' && identity.tokenHash && this.auth.validateIdentity(identity) === true) return true;
+    } catch {
+      this.log.warn('[net] authentication validation failed');
+    }
+    return this.requireAuth(conn, rid);
+  }
+
+  /** Shared by frames, pongs, heartbeat and request guards; a replaced socket must not act on its successor's session. */
+  connectionCurrent(conn) {
+    if (this.closed || conn.closing || conn.ws.readyState !== WS_OPEN) return false;
+    const session = conn.session;
+    if (session && (!session.connected || session.ws !== conn.ws)) {
+      conn.close(CLOSE.REPLACED, 'session replaced');
+      return false;
+    }
+    if (!this.authenticated(conn)) return false;
+    if (this.auth !== null && session && session.accountId !== conn.identity.accountId) return this.requireAuth(conn);
+    return true;
+  }
+
+  /**
+   * Capture the original request owner, not a mutable session.ws lookup. The lobby calls this closure when queued
+   * work actually starts (and after awaits before further mutation); replies use it again when a Promise settles.
+   * @param {Connection} conn
+   * @returns {() => boolean}
+   */
+  requestGuard(conn) {
+    const session = conn.session, ws = conn.ws, identity = conn.identity;
+    return () => !!session && conn.session === session && conn.ws === ws && conn.identity === identity
+      && this.conns.get(ws) === conn && this.registry.byId(session.playerId) === session
+      && this.connectionCurrent(conn);
+  }
+
+  /** Close only sockets authenticated with this exact account+HTTP-session digest, including pending hellos. */
+  revoke(accountId, tokenHash) {
+    if (this.auth === null || typeof accountId !== 'string' || !accountId || typeof tokenHash !== 'string' || !tokenHash) return 0;
+    let count = 0;
+    for (const conn of this.conns.values()) {
+      if (!conn.closing && conn.identity?.accountId === accountId && conn.identity.tokenHash === tokenHash) {
+        this.requireAuth(conn);
+        count++;
+      }
+    }
+    return count;
+  }
+
   /**
    * Upgrade-time admission check (server/http/websocket.js): null to accept, otherwise the reason to refuse.
    * @param {import('node:http').IncomingMessage} req
@@ -559,21 +663,28 @@ export class Network {
   }
 
   /**
-   * Adopt a freshly upgraded socket.
+   * Adopt a freshly upgraded socket. identity comes only from AuthService.websocketIdentity(req) at the upgrade;
+   * checking it again here closes the gap between HTTP authentication and WebSocket adoption.
    * @param {import('ws').WebSocket} ws
    * @param {import('node:http').IncomingMessage} [req]
+   * @param {object | null} [identity]
    */
-  handleConnection(ws, req) {
+  handleConnection(ws, req, identity = null) {
     if (this.closed) { try { ws.close(CLOSE.SHUTDOWN, 'server shutdown'); } catch { /* ignore */ } return; }
-    const conn = new Connection(ws, clientAddress(req, this.opts.trustProxy), this.now(), this.opts);
+    const conn = new Connection(ws, clientAddress(req, this.opts.trustProxy), this.now(), this.opts, identity);
     this.conns.set(ws, conn);
     if (conn.key) this.connsPerKey.set(conn.key, (this.connsPerKey.get(conn.key) || 0) + 1);
     ws.on('message', (data, isBinary) => {
       try { this.onFrame(conn, data, isBinary); } catch (e) { this.log.error('[net] frame handler crashed', e); }
     });
-    ws.on('pong', () => { conn.alive = true; if (conn.session && conn.session.ws === ws) conn.session.lastSeen = this.now(); });
+    ws.on('pong', () => {
+      if (!this.connectionCurrent(conn)) return;
+      conn.alive = true;
+      if (conn.session) conn.session.lastSeen = this.now();
+    });
     ws.on('error', (e) => { this.log.debug?.('[net] socket error', e?.code || e?.message); });
     ws.on('close', () => { try { this.onClose(conn); } catch (e) { this.log.error('[net] close handler crashed', e); } });
+    this.authenticated(conn);
   }
 
   /** @param {Connection} conn @param {object} msg */
@@ -583,10 +694,10 @@ export class Network {
   onFrame(conn, data, isBinary) {
     // A socket we are closing (replaced by another tab, hello timeout, flooding, shutdown) may still have
     // frames in flight; acting on them could e.g. mint an orphan session from a late `hello`.
-    if (conn.closing || this.closed) return;
+    if (!this.connectionCurrent(conn)) return;
     const now = this.now();
     conn.alive = true;
-    if (conn.session && conn.session.ws === conn.ws) conn.session.lastSeen = now;
+    if (conn.session) conn.session.lastSeen = now;
 
     if (!conn.bucket.take(now)) {
       if (now - conn.dropWindowAt >= 1000) { conn.dropWindowAt = now; conn.drops = 0; }
@@ -622,12 +733,15 @@ export class Network {
     if (!conn.session) { this.reply(conn, errorMsg(ERR.BAD_MSG, rid, 'hello required')); return; }
     if (HEAVY_TYPES.has(msg.t) && !conn.heavy.take(now)) { this.reply(conn, errorMsg(ERR.RATE, rid, `${msg.t} too often`)); return; }
 
+    const isCurrent = this.requestGuard(conn);
+    if (!isCurrent()) return;
+    const context = { isCurrent };
     let res;
     try {
       // client-side combat reports (b.progress / b.result, DESIGN §14) belong to the running match like 'g.*' intents:
       // handed to the lobby's match router when the handler has one (server/lobby.js routeGame)
-      if (msg.t.startsWith('b.') && typeof this.handler.routeGame === 'function') res = this.handler.routeGame(conn.session, msg);
-      else res = this.handler.onMessage(conn.session, msg);
+      if (msg.t.startsWith('b.') && typeof this.handler.routeGame === 'function') res = this.handler.routeGame(conn.session, msg, context);
+      else res = this.handler.onMessage(conn.session, msg, context);
     } catch (e) {
       this.log.error(`[net] handler crashed on ${msg.t}`, e);
       res = { error: ERR.INTERNAL };
@@ -636,21 +750,23 @@ export class Network {
       // an answer that has to wait (DESIGN §32.6: a room whose match runs in a match host worker answers once the worker
       // has — server/lobby.js keeps each such room's messages in order): sent when it settles; a rejection is INTERNAL.
       // A vanilla room never answers this way, so its replies go out exactly as before
-      Promise.resolve(res).then((r) => this.answer(conn, msg, rid, r), (e) => {
+      Promise.resolve(res).then((r) => this.answer(conn, msg, rid, r, isCurrent), (e) => {
         this.log.error(`[net] handler failed on ${msg.t}`, e);
-        this.answer(conn, msg, rid, { error: ERR.INTERNAL });
+        this.answer(conn, msg, rid, { error: ERR.INTERNAL }, isCurrent);
       });
       return;
     }
-    this.answer(conn, msg, rid, res);
+    this.answer(conn, msg, rid, res, isCurrent);
   }
 
   /**
    * The direct reply to a handled message: `error` (with the ERR code) or `ok` when the request carried a rid. Never
    * throws (a socket closed meanwhile simply gets nothing).
    * @param {Connection} conn @param {any} msg @param {unknown} rid @param {any} res the handler's result
+   * @param {() => boolean} [isCurrent]
    */
-  answer(conn, msg, rid, res) {
+  answer(conn, msg, rid, res, isCurrent = this.requestGuard(conn)) {
+    if (!isCurrent()) return;
     if (res && res.error) {
       // fire-and-forget battle progress (no rid) that reached no running match — the match just ended, the room went
       // back to the lobby — is stale, not a client mistake: never answered (DESIGN §14; a rid-less error frame would
@@ -662,29 +778,54 @@ export class Network {
 
   /** @param {Connection} conn @param {any} msg @param {number} now */
   onHelloMsg(conn, msg, now) {
+    if (!this.connectionCurrent(conn)) return;
     const rid = msg.rid;
-    if (msg.version != null && msg.version !== PROTOCOL_VERSION) {
+    if (msg.version !== PROTOCOL_VERSION && (this.auth !== null || msg.version != null)) {
       this.reply(conn, errorMsg(ERR.BAD_MSG, rid, `version mismatch: server ${PROTOCOL_VERSION}`));
       return;
     }
     const name = sanitizeName(msg.name);
     if (!name) { this.reply(conn, errorMsg(ERR.BAD_MSG, rid, 'bad field name')); return; }
 
+    // Validate even a repeat hello's explicit reconnect token; authenticated hellos never silently ignore a
+    // foreign/unknown credential and never reinterpret an invalid recovery request as a fresh session.
+    let reconnect = null;
+    if (this.auth !== null && msg.token != null) {
+      reconnect = this.registry.byToken(msg.token);
+      if (!reconnect || reconnect.accountId !== conn.identity.accountId || (conn.session && reconnect !== conn.session)) {
+        this.reply(conn, errorMsg(ERR.INVALID_RECONNECT, rid));
+        return;
+      }
+    }
     let session = conn.session;
     let resumed = false;
     const repeat = !!session;
     if (!session) {
-      session = msg.token ? this.registry.byToken(msg.token) : null;
+      if (this.auth !== null) {
+        // Check ownership above before touching the old socket. No token may resume this account's own session.
+        if (msg.token != null) session = reconnect;
+        else {
+          session = this.registry.byAccount(conn.identity.accountId);
+          if (!session) {
+            // byAccount deliberately leaves expired records indexed until their onExpire callback is delivered.
+            this.sweep();
+            if (!this.connectionCurrent(conn)) return;
+            session = this.registry.byAccount(conn.identity.accountId);
+          }
+        }
+      } else session = msg.token ? this.registry.byToken(msg.token) : null;
       if (session) {
+        const takeover = this.auth !== null && msg.takeover === true;
         if (session.connected && session.ws && session.ws !== conn.ws
-          && (msg.noReplace || (Number.isFinite(msg.claimAt) && session.claimAt != null && msg.claimAt > session.claimAt))) {
+          && (msg.noReplace || (this.auth !== null && !takeover)
+            || (!takeover && Number.isFinite(msg.claimAt) && session.claimAt != null && msg.claimAt > session.claimAt))) {
           this.reply(conn, errorMsg(ERR.SESSION_IN_USE, rid));
           return;
         }
         resumed = true;
         if (session.ws && session.ws !== conn.ws) this.detachReplaced(session.ws);
       } else {
-        session = this.registry.create(name);
+        session = this.registry.create(name, this.auth !== null ? conn.identity.accountId : null);
         if (!session) { this.reply(conn, errorMsg(ERR.INTERNAL, rid, 'server full')); return; }
       }
       conn.session = session;
@@ -700,11 +841,13 @@ export class Network {
 
     let extra = null;
     try { extra = this.handler.welcomeInfo?.() ?? null; } catch (e) { this.log.error('[net] welcomeInfo crashed', e); }
+    if (!this.connectionCurrent(conn)) return;
     const welcome = { ...(extra && typeof extra === 'object' ? extra : null), t: 'welcome', playerId: session.playerId, token: session.token, name: session.name, serverNow: now, version: PROTOCOL_VERSION, resumed };
+    if (this.auth !== null) welcome.account = accountView(conn.identity);
     if (validRid(rid)) welcome.rid = rid;
     this.reply(conn, welcome);
     try {
-      this.handler.onHello?.(session, { resumed, repeat });
+      this.handler.onHello?.(session, { resumed, repeat, isCurrent: this.requestGuard(conn) });
     } catch (e) {
       this.log.error('[net] onHello crashed', e);
     }
@@ -723,6 +866,7 @@ export class Network {
 
   /** @param {Connection} conn */
   onClose(conn) {
+    conn.closing = true;
     if (this.conns.delete(conn.ws) && conn.key) {
       const n = (this.connsPerKey.get(conn.key) || 1) - 1;
       if (n > 0) this.connsPerKey.set(conn.key, n);
@@ -745,15 +889,16 @@ export class Network {
       try {
         if (conn.closing) {
           // Closing handshake never completed within a heartbeat interval → drop the TCP connection.
-          if (!conn.alive) conn.ws.terminate();
+          if (!conn.alive) conn.terminate();
           conn.alive = false;
           continue;
         }
+        if (!this.connectionCurrent(conn)) continue;
         if (!conn.session && now - conn.openedAt > this.opts.helloTimeoutMs) {
           conn.close(CLOSE.HELLO_TIMEOUT, 'hello timeout');
           continue;
         }
-        if (!conn.alive) { conn.ws.terminate(); continue; }
+        if (!conn.alive) { conn.terminate(); continue; }
         conn.alive = false;
         conn.ws.ping();
       } catch (e) {
@@ -782,7 +927,7 @@ export class Network {
     clearInterval(this.sweepTimer);
     for (const conn of this.conns.values()) {
       conn.close(code, reason);
-      const t = setTimeout(() => { try { conn.ws.terminate(); } catch { /* ignore */ } }, 1000);
+      const t = setTimeout(() => conn.terminate(), 1000);
       t.unref?.();
     }
   }

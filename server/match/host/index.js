@@ -8,6 +8,9 @@
 //     and registries, so a plugin's data can never leak into another room, and a plugin that hangs or crashes its host
 //     ends that set's matches only.
 //
+//   checkCreate(cs) → void — a synchronous, read-only content/worker-capacity gate (throws the same HostError as
+//     create); no worker is booted or evicted and no capacity is reserved. The lobby can check, reserve admission, then
+//     create. create checks again: a successful preflight is not a promise that its later boot will succeed.
 //   create(cs, opts) → a MatchProxy (server/match/host/proxy.js) — the lobby's room.match. The worker is started on the
 //     first match of a set (the set's data bytes and hash input from server/plugins/contentSets.js: the worker checks them
 //     against `cs` before it imports the match) and kept while it has matches, then IDLE_MS more [ASSUMED 10 min: the
@@ -37,9 +40,11 @@
 import { Worker } from 'node:worker_threads';
 import { fork } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { childEnvironment } from '../../auth/child-env.js';
 import { ERR } from '../../../shared/constants.js';
 import { csUrlPart } from '../../../shared/plugins/identity.js';
 import { MatchProxy } from './proxy.js';
+import { matchRuntimeOptions } from '../Match.js';
 import { validHostMessage } from './ipc.js';
 import { scriptExecution, verifyScripts } from '../../../shared/plugins/scriptLoad.js';
 import { forkSandbox, sandboxInit, scriptMode } from './childHost.js';
@@ -77,12 +82,9 @@ export function createMatchHosts({ contents, log = noopLog, options = {} }) {
 
   /** One worker (or child process) and the matches of its content set. */
   class WorkerHost {
-    constructor(cs) {
+    constructor(cs, { set, files }) {
       this.cs = cs;
       this.tag = `[cs:${csUrlPart(cs).slice(0, 8)}]`;
-      const set = contents.get(cs);
-      const files = set ? contents.dataBytes(cs) : null;
-      if (!set || !files) throw new HostError(ERR.INTERNAL, `the content set ${csUrlPart(cs)} is not kept by this server`);
       const scripts = set.scripts || [];
       if (scripts.length) verifyScripts(scripts, set.hashInput);
       const sandbox = scriptExecution(scripts) === 'sandbox';
@@ -118,7 +120,7 @@ export function createMatchHosts({ contents, log = noopLog, options = {} }) {
       if (this.transport === 'process') {
         // a child process: its memory limit is its own (an out-of-memory abort ends it alone — see the header)
         const mb = Math.max(64, Number(o.resourceLimits?.maxOldGenerationSizeMb) || HOST_DEFAULTS.resourceLimits.maxOldGenerationSizeMb);
-        this.child = sandbox ? forkSandbox(ENTRY, { memoryMb: mb }) : fork(ENTRY, [], { execArgv: [`--max-old-space-size=${mb}`], serialization: 'advanced', stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
+        this.child = sandbox ? forkSandbox(ENTRY, { memoryMb: mb }) : fork(ENTRY, [], { env: childEnvironment(), execArgv: [`--max-old-space-size=${mb}`], serialization: 'advanced', stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
         // the last lines it printed (an abort's "FATAL ERROR …") go into the log when it dies
         this.stderr = '';
         this.child.stderr?.on('data', (d) => { this.stderr = (this.stderr + String(d)).slice(-2000); });
@@ -134,7 +136,7 @@ export function createMatchHosts({ contents, log = noopLog, options = {} }) {
         this.kill = () => { try { this.child.kill('SIGKILL'); } catch { /* gone */ } };
         this.send({ type: 'init', ...(sandbox ? sandboxInit(init) : init) });
       } else {
-        this.worker = new Worker(ENTRY, { workerData: init, resourceLimits: { ...o.resourceLimits }, stdout: false, stderr: false });
+        this.worker = new Worker(ENTRY, { env: childEnvironment(), workerData: init, resourceLimits: { ...o.resourceLimits }, stdout: false, stderr: false });
         this.worker.unref?.();
         this.worker.on('message', (m) => this.onMessage(m));
         this.worker.on('error', failed);
@@ -208,28 +210,48 @@ export function createMatchHosts({ contents, log = noopLog, options = {} }) {
   }, Math.max(100, Math.min(1000, Math.floor(o.watchdogMs / 4))));
   watchdog.unref?.();
 
-  /** A worker for `cs`: the running one, or a new one (an idle one of another set stopped when the limit is reached). */
-  function hostFor(cs) {
-    const cur = hosts.get(cs);
-    if (cur && !cur.dead) return cur;
+  /** The same read-only gate for preflight and create. Returning an idle candidate does not stop or reserve it. */
+  function checkCreateState(cs) {
+    if (closed) throw new HostError(ERR.INTERNAL, 'the server is stopping');
+    const current = hosts.get(cs);
+    // A live worker already owns its content snapshot; reusing it needs neither a boot nor another worker slot.
+    if (current && !current.dead) return { current };
+    let idle = null;
     if (hosts.size >= o.maxWorkers) {
-      const idle = [...hosts.values()].find((h) => !h.matches.size);
-      if (idle) idle.stop(null, 'room for another content set');
-      else throw new HostError(ERR.PLUGIN_BUSY, `${hosts.size} match hosts run (limit ${o.maxWorkers})`);
+      idle = [...hosts.values()].find((h) => !h.matches.size);
+      if (!idle) throw new HostError(ERR.PLUGIN_BUSY, `${hosts.size} match hosts run (limit ${o.maxWorkers})`);
     }
-    const h = new WorkerHost(cs);
+    const set = contents.get(cs);
+    const files = set ? contents.dataBytes(cs) : null;
+    if (!set || !files) throw new HostError(ERR.INTERNAL, `the content set ${csUrlPart(cs)} is not kept by this server`);
+    return { current: null, idle, content: { set, files } };
+  }
+
+  /** A worker for `cs`: recheck now, then reuse or boot (evict an idle worker only here, never during preflight). */
+  function hostFor(cs) {
+    const checked = checkCreateState(cs);
+    if (checked.current) return checked.current;
+    if (checked.idle) checked.idle.stop(null, 'room for another content set');
+    const h = new WorkerHost(cs, checked.content);
     hosts.set(cs, h);
     return h;
   }
 
   return {
     /**
+     * Synchronous resource preflight: returns undefined, or throws HostError. Does not boot, evict, arm/clear timers,
+     * or reserve anything; script validation and worker startup still belong to create, which checks resources again.
+     * @param {string} cs
+     */
+    checkCreate(cs) { checkCreateState(cs); },
+    /**
      * The match of a room playing the content set `cs` (with gameplay plugins), run in that set's worker.
      * @param {string} cs @param {any} opts the lobby's Match options (send / broadcast / onEnd stay here)
      * @returns {MatchProxy}
      */
     create(cs, opts) {
-      if (closed) throw new HostError(ERR.INTERNAL, 'the server is stopping');
+      // Refuse inconsistent runtime metadata before booting or reserving a match host.
+      opts = matchRuntimeOptions(opts);
       const h = hostFor(cs);
       if (h.idleTimer) { clearTimeout(h.idleTimer); h.idleTimer = null; }
       const matchId = `${opts.roomCode ?? 'room'}-${opts.matchNo ?? 0}-${++seq}`;

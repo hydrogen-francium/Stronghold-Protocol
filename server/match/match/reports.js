@@ -49,6 +49,17 @@ export class MatchReports {
     return OK;
   }
 
+  /** 接收权威客户端的报告超限声明；每个当前战场仅启动一次原有服务端分片结算。 */
+  _onResultFallback(ps, msg) {
+    if (!this.clientCombat) return fail(ERR.WRONG_PHASE, 'server-run combat');
+    const f = this._fieldByBattle(msg.battleId);
+    if (!f || f.done || f.heldResult || f.verifyJob || f.mode !== 'client' || f.authority !== ps.playerId) return OK;
+    if (this.requireCs && msg.cs !== this.cs) return fail(ERR.BAD_MSG, 'content set mismatch');
+    // 切换立即清除客户端权威；重复、旧场次及其他玩家的声明不会重复排队或结算。
+    this._runOnServer(f, msg.reason);
+    return OK;
+  }
+
   /** b.result from a field's authority: validated against the spec; an implausible one is replaced by the server's run. */
   _onResult(ps, msg) {
     if (!this.clientCombat) return fail(ERR.WRONG_PHASE, 'server-run combat');

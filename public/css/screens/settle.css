@@ -41,6 +41,9 @@
 .sintro__seat.is-me { filter: drop-shadow(0 0 .1rem rgba(87, 214, 196, .9)); }
 .sintro__seat.is-out, .sintro__seat.is-left { filter: grayscale(1) brightness(.6); }
 .sintro__seat.is-empty { filter: grayscale(1) brightness(.35); }
+/* 高位稀疏席位不再映射到四张旧素材；缩小编号卡并缩短错峰，确保演出结束前全部出现。 */
+.sintro--dense .sintro__seat { width: .9rem; height: .9rem; animation-delay: calc(180ms + var(--i) * 20ms); }
+.sintro--dense .sintro__seat .sintro__tile { width: .82rem; height: .82rem; font-size: calc(.28 * var(--t)); }
 .sintro__foot { position: absolute; left: 8.6rem; top: 9.8rem; width: 2rem; height: .12rem; }
 small.sintro__foot { left: 9.6rem; width: auto; height: auto; transform: translateX(-50%); white-space: nowrap; font-family: var(--font-display); font-size: calc(.16 * var(--t)); letter-spacing: .08em; color: #d77a2e; }
 @keyframes sintro-spin { from { opacity: 0; transform: rotate(-40deg) scale(.9); } }
@@ -285,6 +288,10 @@ span.settle__nexticon .icon { width: .3rem; height: .3rem; }
 .steam .slogo { left: .45rem; top: .2rem; }
 .steam .slogo__img { height: .56rem; }
 .steam__cards { position: absolute; left: 0; right: 0; top: .66rem; display: flex; justify-content: center; gap: .95rem; }
+/* 扩展队伍保留完整结算卡，用横向滚动替代居中溢出导致两端无法访问。 */
+.steam__cards--many { justify-content: flex-start; gap: .3rem; padding: 0 .3rem .12rem; overflow-x: auto; overflow-y: hidden;
+  max-height: 8.4rem; overflow-y: auto; box-sizing: border-box; touch-action: pan-x pan-y; overscroll-behavior: contain; scrollbar-width: thin; }
+.steam__cards--many .tcard { animation-delay: calc(150ms + min(var(--i), 3) * 120ms); }
 .tcard { position: relative; isolation: isolate; width: 3.47rem; flex: none; display: flex; flex-direction: column; animation: tcard-in 560ms var(--ease-out) calc(150ms + var(--i) * 120ms) both; }
 @keyframes tcard-in { 0% { opacity: 0; transform: translateY(-.3rem); filter: brightness(2.4) saturate(0); } 50% { opacity: 1; } }
 .tcard::before { content: ''; position: absolute; left: -.06rem; right: -.06rem; top: .36rem; bottom: .7rem; background: rgba(22, 27, 26, .78); box-shadow: 0 0 0 1px rgba(180, 196, 192, .14); z-index: -1; }

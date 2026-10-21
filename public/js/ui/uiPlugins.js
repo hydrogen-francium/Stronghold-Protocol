@@ -1,6 +1,6 @@
-// ui/uiPlugins.js — this browser's interface plugins (DESIGN §32.8). Kept in localStorage, never sent:
-//   sp.pref.ui-plugins     the ids the player turned on (设置 → 界面插件)
-//   sp.pref.ui-recommend   the ids the host marked 推荐 on this browser
+// ui/uiPlugins.js — this account's interface plugins in this browser (DESIGN §32.8). Kept locally, never sent:
+//   sp.account.<id>.pref.ui-plugins     the ids the player turned on (设置 → 界面插件)
+//   sp.account.<id>.pref.ui-recommend   the ids the host marked 推荐 on this browser
 // A recommendation does not turn a plugin on. Another player's page cannot see this browser's mark until the protocol
 // supplies the list on the existing room.state (read here if it is already an array: room.uiRecommend,
 // room.content.uiRecommend, room.state.uiRecommend, room.state.content.uiRecommend). No new protocol message.
@@ -10,7 +10,7 @@ import { createStore, loadPref, savePref } from '../store.js';
 import { isPluginId } from '../../../shared/plugins/manifest.js';
 import { UI_ERRORS, UI_LIMITS } from '../../../shared/plugins/ui.js';
 
-/** localStorage preference (`sp.pref.<key>`) of the interface plugins this browser has on. */
+/** Account-scoped preference key of the interface plugins this browser has on. */
 export const UI_PREF = 'ui-plugins';
 /** localStorage preference of the ids this browser's host has marked 推荐. */
 export const UI_RECOMMEND_PREF = 'ui-recommend';

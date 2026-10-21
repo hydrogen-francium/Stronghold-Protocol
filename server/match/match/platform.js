@@ -14,10 +14,11 @@ import { ruleOption } from '../../../shared/plugins/rules.js';
 const GAME_TYPES = new Set(Object.keys(C2S).filter((t) => Object.hasOwn(C2S, t) && (t.startsWith('g.') || t.startsWith('b.'))));
 
 export class MatchPlatform {
+  /** 从大厅启动对局并检查本局普通干员目录；失败沿用既有结束流程，成功进入开局确认。 */
   start() {
     if (this.disposed || this.ended || this.phase !== PHASE.LOBBY) return;
     this.guard(() => {
-      if (!this.gd.visibleChess.length || this.pool.entries.size === 0) {
+      if (!this.gd.visibleChess.length || this.order[0].chessPool.entries.size === 0) {
         this.log.error?.(`[match ${this.roomCode}] game data unusable (no chess pool) — ending the match`);
         this.phase = PHASE.INFO_CHECK;
         this.markPublic();
@@ -53,7 +54,7 @@ export class MatchPlatform {
       // A report that crossed the match end (the last b.progress of a field, a delegated rehearsal's answer) is stale:
       // ignored, never an error (DESIGN §14 — an error frame without a rid would surface as a toast in the browser).
       if (msg && msg.t === 'b.rehearsalResult') return OK;
-      return this.clientCombat && msg && (msg.t === 'b.progress' || msg.t === 'b.result') ? OK : fail(ERR.WRONG_PHASE);
+      return this.clientCombat && msg && (msg.t === 'b.progress' || msg.t === 'b.result' || msg.t === 'b.resultFallback') ? OK : fail(ERR.WRONG_PHASE);
     }
     if (!msg || typeof msg !== 'object' || typeof msg.t !== 'string' || !GAME_TYPES.has(msg.t)) return fail(ERR.BAD_MSG);
     let res;

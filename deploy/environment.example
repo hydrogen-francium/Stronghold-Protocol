@@ -1,0 +1,6 @@
+# 复制到仓库根 .env 后填写；此文件不是可直接上线的完整配置。
+SP_DOMAIN=game.example.com
+ACME_EMAIL=operator@example.com
+SP_ENTRY_TOKEN_PATH=./deploy/secrets/entry-token
+SP_SESSION_SECRET_PATH=./deploy/secrets/session-secret
+SP_REGISTRATION_OPEN=1

@@ -481,6 +481,7 @@ export function createBattleRunner(deps) {
     if (e && e.battle.finished && (e.held.length || e.stale)) emitFrame(e, false);
   }
 
+  /** 发送当前权威战场的有界进度；联防来源保留原始来源标识，不按参战人数截断。 */
   function progress(e, force = false) {
     if (!e.authoritative || e.resultSent || !net) return;
     const t = now();
@@ -508,12 +509,13 @@ export function createBattleRunner(deps) {
       }
     } else {
       msg.leaks = Math.min(1e6, p.leaks);
-      // 联防: the leakers' enemies still standing (shared/protocol.js b.progress `left`, ≤ 4 players)
-      if (p.left) msg.left = Object.fromEntries(Object.entries(p.left).slice(0, 4));
+      // 联防来源与参战者不是同一维度；原规范最多十五个来源，服务端仍核对真实来源集合。
+      if (p.left) msg.left = p.left;
     }
     try { net.send('b.progress', msg); } catch { /* offline */ }
   }
 
+  /** 战场结束后只发送一次完整结果或接管声明，不把超限报告伪装成成功结算。 */
   function finished(e) {
     if (e.done) return;
     e.done = true;
@@ -521,11 +523,15 @@ export function createBattleRunner(deps) {
     if (e.authoritative && !e.resultSent && net) {
       progress(e, true);
       e.resultSent = true;
-      let result = null;
+      let report = null;
       try {
-        result = e.host.compactResult({ bossLike: bossLike(e), battleId: e.battleId });
+        report = e.host.resultReport({ battleId: e.battleId });
       } catch (err) { console.warn('[runner] result failed', err); recordError('runner', err, 'result failed'); }
-      if (result) {
+      if (report?.reason) {
+        e.resultFallback = report.reason;
+        deliver(e);
+      } else if (report?.result) {
+        const result = report.result;
         e.result = result;
         // the view answers with the settlement voice of this battle (screens/game.js → audio.voice result*): the
         // compact result carries the leaks and the kill count the slot is picked from
@@ -538,21 +544,22 @@ export function createBattleRunner(deps) {
   }
 
   /**
-   * Send an entry's b.result (retried once on a timeout). `e.delivery`: 'pending' while a request is out, 'delivered'
-   * once the server answered (ok, or a refusal — final), 'undelivered' when it never got there (LOST_RESULT_CODES): kept
-   * for redeliver() (session back online) and for an authoritative b.start of the finished battle.
+   * 发送战场报告或接管声明，复用原有一次超时重发和断线恢复机制。
+   * 参数是已结束战场；副作用为网络请求与发送状态更新，不产生本地结算。
    */
   function deliver(e) {
-    if (!net || !e.result || e.delivery === 'pending') return;
+    if (!net || (!e.result && !e.resultFallback) || e.delivery === 'pending') return;
     e.delivery = 'pending';
     // a room's content set names itself in the result (DESIGN §32.6: the server refuses one without it) — the set the
     // battle was actually simulated on (its simulation's `cs`: loadBrowserSim's), never only what the spec claims; the
     // original content's result is what it always was
     const cs = e.sim && typeof e.sim.cs === 'string' && e.sim.cs ? e.sim.cs : null;
-    const msg = cs ? { battleId: e.battleId, result: e.result, cs } : { battleId: e.battleId, result: e.result };
+    const type = e.resultFallback ? 'b.resultFallback' : 'b.result';
+    const payload = e.resultFallback ? { reason: e.resultFallback } : { result: e.result };
+    const msg = { battleId: e.battleId, ...payload, ...(cs ? { cs } : {}) };
     const send = (tries) => {
       let req;
-      try { req = net.request('b.result', msg, { timeout: 15000 }); } catch (err) { req = Promise.reject(err); }
+      try { req = net.request(type, msg, { timeout: 15000 }); } catch (err) { req = Promise.reject(err); }
       return Promise.resolve(req).then(() => { e.delivery = 'delivered'; }, (err) => {
         const code = err && err.code;
         if (code === 'TIMEOUT' && tries > 0) return send(tries - 1);

@@ -19,7 +19,7 @@ export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '
 export const noopLog = { info() {}, warn() {}, error() {}, debug() {} };
 
 /** startServer() options handed on to net.js Network / lobby.js Lobby (an absent one keeps that module's default). */
-const NET_OPTION_KEYS = ['reconnectWindowMs', 'heartbeatMs', 'helloTimeoutMs', 'ratePerSec', 'rateBurst', 'maxConnections', 'abuseDropsPerSec',
+const NET_OPTION_KEYS = ['reconnectWindowMs', 'heartbeatMs', 'helloTimeoutMs', 'ratePerSec', 'rateBurst', 'maxConnections', 'maxSessions', 'abuseDropsPerSec',
   'maxConnectionsPerAddr', 'heavyPerSec', 'heavyBurst', 'trustProxy'];
 const LOBBY_OPTION_KEYS = ['lobbyGraceMs', 'maxRooms', 'maxRoomsPerAddr', 'maxMatchesPerAddr', 'resyncMinGapMs', 'soloReconnectWindowMs'];
 
@@ -105,6 +105,13 @@ export function lobbyOptionsFrom(opts) {
   const lobbyOptions = {};
   for (const k of LOBBY_OPTION_KEYS) {
     if (opts[k] != null) lobbyOptions[k] = opts[k];
+  }
+  if (lobbyOptions.maxMatchesPerAddr == null && process.env.SP_MAX_MATCHES_PER_ADDR !== undefined) {
+    const raw = process.env.SP_MAX_MATCHES_PER_ADDR;
+    if (!/^[1-9][0-9]{0,3}$/.test(raw) || Number(raw) < 16 || Number(raw) > 1024) {
+      throw Object.assign(new Error('Invalid SP_MAX_MATCHES_PER_ADDR (expected 16..1024)'), { code: 'AUTH_CONFIG', setting: 'SP_MAX_MATCHES_PER_ADDR' });
+    }
+    lobbyOptions.maxMatchesPerAddr = Number(raw);
   }
   return lobbyOptions;
 }

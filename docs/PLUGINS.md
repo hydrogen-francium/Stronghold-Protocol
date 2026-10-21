@@ -1195,8 +1195,9 @@ set; stop a running match/server to revoke already executing code.
 **Consent and bytes (native trusted execution).** A trusted room adds `content.trusted = { plugins: [{ id, version, hash, permissions, authors }],
 consent: { <seat>: boolean } }`. `hash` identifies the canonical gameplay file snapshot (§6), excluding notices and personal themes; server-owner pins still use the full raw lock SHA-256. `room.consent { cs, accept }` affects only the sender's
 seat; every active human must accept before `room.start` (`PLUGIN_CONSENT`). Bots need no page consent. Disconnects
-keep the seat's consent, a new cs clears it. The browser remembers its own decision in `sp.plugin.consent.<cs>`;
-server state alone never authorizes page execution. The risk dialog names authors, hashes and permissions and says
+keep the seat's consent, a new cs clears it. In this fork, the browser remembers the verified account's decision in
+`sp.account.<accountId>.pref.plugin.consent.<cs>`; no account scope means no read/write, and an old guest or another
+account's consent is never adopted. Server state alone never authorizes page execution. The risk dialog names authors, hashes and permissions and says
 「它可以完全控制你的游戏页面」; seats show 「已同意」 and a red 「受信任插件」 banner stays through the match.
 
 Scripts are immutable `scripts/<id>.json` descriptors containing the original manifest and entry source texts.
@@ -1296,7 +1297,11 @@ opaque string `"null"` and it cannot read this site's storage or credentials. Th
 and a transparent background. [ASSUMED] That clears the opaque white canvas; a background the plugin's own page paints
 still shows. The generated Forge skeleton and `plugins/_template/ui/` set `color-scheme: dark` on `html` for the same
 reason. The iframe points straight at that plugin's own
-`/p/<id>/<hash8>/<entry>`. Its first load is the entry, and any later load destroys the frame: the host then clears
+`/p/<id>/<hash8>/<entry>`. In this fork its initial navigation uses the authenticated parent site's cookies: it is not
+`credentialless`, and `/p/` is not an exception to the HTTP authentication gate. The opaque sandbox and the independent
+frame CSP still prevent script access to the parent's credentials; they do not mean that the initial HTTP request is
+anonymous. This authenticated navigation has not yet been browser-verified in the integrated fork.
+Its first load is the entry, and any later load destroys the frame: the host then clears
 `ready` and posts nothing more. `postMessage` to `"null"` cannot tell those documents
 apart. Files at `/p/` for a ui plugin, and not cosmetic art, are sent with
 `Content-Security-Policy: default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'none'; sandbox allow-scripts; frame-ancestors 'self'; base-uri 'none'; form-action 'none'`
@@ -1314,8 +1319,17 @@ result screen; no lineup, diy or seed), `net` (connection status; latency is the
 is a client intent) on change and then at most once a second, and `state.room` (seats, including empty holes, and the
 room's plugin ids, never the join code). `welcome` may add `version` (`PROTOCOL_VERSION`), `lang`, `plugins` and the
 scalar prefs already stored for that plugin. A plugin that only reads `t === 'welcome'` keeps working. The plugin may
-ask for a slot, a height, a short notice, and a few namespaced storage keys (`sp.plugin.<id>.`, proxied by the host
-page). It cannot send a match intent: a message whose type is `hello`, `ping`, `room.*`, `g.*` or `b.*`, or that
+ask for a slot, a height, a short notice, and a few namespaced storage keys (proxied by the host page). The shared
+`namespacedStorageKey` helper retains its logical `sp.plugin.<id>.<key>` namespace; this fork stores it at
+`sp.account.<accountId>.pref.sp.plugin.<id>.<key>`. Both the plugin and its in-memory entries belong to the account
+that mounted the frame. A missing/unbound account cannot read even the `keys` list or receive a queued private feed;
+old guest or other-account keys are not migrated. Studio previews use fake state and volatile entries only, without
+writing browser storage or receiving live game feeds. Logout or an account change calls terminal
+`stopPluginFrames()`: destroy frames, clear entries/queued messages/timers, unsubscribe feeds and reject late remounts
+for the rest of that document; a different account needs a full-page load. These integration changes have authored
+regressions but have not yet been executed in this fork.
+
+It cannot send a match intent: a message whose type is `hello`, `ping`, `room.*`, `g.*` or `b.*`, or that
 carries one, is rejected. The host never turns a plugin message into a client→server message. Nothing in these feeds
 lets the frame reach the parent page.
 

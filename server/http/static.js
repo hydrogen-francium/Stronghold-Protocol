@@ -71,6 +71,7 @@ import { createVisualSets } from '../plugins/visualSet.js';
 import { isStudioPath } from '../studio/paths.js';
 import { PACKS_URL, PACK_INDEX_FILE } from '../../shared/packs.js';
 import { PLUGINS_URL, PLUGIN_INDEX_VERSION, buildPluginIndex, extOf, isPackPath, isPluginId } from '../../shared/plugins/manifest.js';
+import { BUNDLE_MANIFESTS } from './assetBundle.js';
 import { csUrlPart } from '../../shared/plugins/identity.js';
 import { FILE_URL_DIGITS, PLUGIN_AUDIO_EXTS, PLUGIN_FILES_URL, VISUAL_DOC_FILE, VISUAL_SETS_URL, VS_URL_DIGITS } from '../../shared/plugins/visual.js';
 import { SIM_WORKER_CSP } from './csp.js';
@@ -106,8 +107,8 @@ const FILE_HASH = new RegExp(`^[0-9a-f]{${FILE_URL_DIGITS}}$`);
 const CS_FILE = /^\/cs\/([0-9a-f]{16})\/([A-Za-z0-9._\/-]{1,200})$/;
 
 /**
- * Create the static request handler.
- * @param {{ publicDir: string, dataDir: string, sharedDir: string, simDir?: string, packsDir?: string, pluginsDir?: string,
+ * 创建静态处理器；素材及清单可使用独立版本根，不覆盖镜像代码或业务数据。
+ * @param {{ publicDir: string, dataDir: string, assetPublicDir?: string, assetDataDir?: string, sharedDir: string, simDir?: string, packsDir?: string, pluginsDir?: string,
  *   packs?: ReturnType<typeof createPluginRegistry>, content?: import('../plugins/identity.js').VanillaContent | null,
  *   log?: object,
  *   assetIndex?: ReturnType<typeof import('./assetIndex.js').createAssetIndex> | null,
@@ -122,14 +123,17 @@ const CS_FILE = /^\/cs\/([0-9a-f]{16})\/([A-Za-z0-9._\/-]{1,200})$/;
  *   set's /cs/ manifest)
  * @returns {(req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse, rawPath: string, query: string) => Promise<void>}
  */
-export function createStaticHandler({ publicDir, dataDir, sharedDir, simDir = path.join(ROOT, 'server', 'sim'), packsDir = path.join(ROOT, 'packs'),
+export function createStaticHandler({ publicDir, dataDir, assetPublicDir = publicDir, assetDataDir = dataDir, sharedDir, simDir = path.join(ROOT, 'server', 'sim'), packsDir = path.join(ROOT, 'packs'),
   pluginsDir = path.join(path.dirname(path.resolve(packsDir)), 'plugins'), packs = null, content = null, log = noopLog,
   assetIndex = null, views = null, visual = null, contents = null }) {
-  const registry = packs || createPluginRegistry({ publicDir, dataDir, packsDir, pluginsDir }, { log: /** @type {any} */ (log) });
+  const registry = packs || createPluginRegistry({ publicDir, dataDir, assetDataDir, packsDir, pluginsDir }, { log: /** @type {any} */ (log) });
   const sets = visual || (typeof registry.pluginFile === 'function' ? createVisualSets({ registry, log }) : null);
   let vanilla = content;
   const vanillaContent = () => (vanilla ||= computeVanillaContent({ simDir, sharedDir, dataDir, shim: DATA_SHIM_JS, log: /** @type {any} */ (log) }));
   const mounts = [
+    // 仅素材前缀切换至版本卷，页面、模拟代码与业务数据仍由镜像提供。
+    { prefix: '/assets/', name: 'public', dir: path.resolve(assetPublicDir, 'assets'), indexRoot: 'assets' },
+    { prefix: '/fonts/', name: 'public', dir: path.resolve(assetPublicDir, 'fonts'), indexRoot: 'fonts' },
     { prefix: '/data/', name: 'data', dir: path.resolve(dataDir) },
     { prefix: '/shared/', name: 'shared', dir: path.resolve(sharedDir) },
     // the simulation: ES modules only (no directory listings, no other file types, no Node-only loader)
@@ -247,7 +251,7 @@ export function createStaticHandler({ publicDir, dataDir, sharedDir, simDir = pa
     }
     // Extension-less audio (download-manager avoidance): /media/bgm/act1 → /assets/audio/bgm/act1.mp3
     if (decoded.startsWith(MEDIA_PREFIX)) {
-      await serveMedia(req, res, decoded.slice(MEDIA_PREFIX.length), query, publicDir, gzipCache, log, { urlHash, assetIndex });
+      await serveMedia(req, res, decoded.slice(MEDIA_PREFIX.length), query, assetPublicDir, gzipCache, log, { urlHash, assetIndex });
       return;
     }
     // The served manifests: every art URL with its content hash (assetViews.js), once the index is ready
@@ -259,7 +263,11 @@ export function createStaticHandler({ publicDir, dataDir, sharedDir, simDir = pa
       }
     }
     // Bare mount paths (e.g. "/data") → treat as the mount directory.
-    const mount = mounts.find((m) => decoded.startsWith(m.prefix) || decoded === m.prefix.slice(0, -1)) || mounts[mounts.length - 1];
+    const baseMount = mounts.find((m) => decoded.startsWith(m.prefix) || decoded === m.prefix.slice(0, -1)) || mounts[mounts.length - 1];
+    // 完成标记已在启动时验证；这里仅替换三份精确命中的素材清单，不允许覆盖业务数据。
+    const artName = decoded.slice('/data/'.length);
+    const mount = decoded.startsWith('/data/') && BUNDLE_MANIFESTS.includes(artName)
+      ? { ...baseMount, dir: path.resolve(assetDataDir) } : baseMount;
     const rest = decoded.length > mount.prefix.length ? decoded.slice(mount.prefix.length) : '';
     const segments = rest.split('/').filter((s) => s.length > 0);
     if (segments.some((s) => s === '..' || s === '.')) { sendError(req, res, 403, '禁止访问 · Forbidden'); return; }
@@ -315,6 +323,7 @@ export function createStaticHandler({ publicDir, dataDir, sharedDir, simDir = pa
       }
       return;
     }
+    if (mount.indexRoot) segments.unshift(mount.indexRoot);
     const first = segments[0] || '';
     if (mount.name === 'public' && (first.toLowerCase().startsWith('studio') || /[^\x00-\x7f]/.test(first))) {
       const studio = await studioRealPath();

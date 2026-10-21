@@ -5,9 +5,10 @@
 //
 //   start()                                  the worker creates the match and starts it (the worker may still be booting:
 //                                            the host queues the messages; the match exists for the lobby at once)
-//   handle / setLoadout / requestSetupReroll / cancelSetupReroll → Promise of the match's answer ({ ok } | { error, detail })
-//                                            — the lobby answers the request when it settles (server/net.js)
-//   onDisconnect / onReconnect / onLeave / addSpectator / removeSpectator → posted, no answer
+//   handle / setLoadout / requestSetupReroll / cancelSetupReroll / onLeave → Promise of the match's answer
+//                                            ({ ok } | { error, detail }) — the lobby waits for the worker's confirmation;
+//                                            posting onLeave alone never confirms a permanent departure
+//   onDisconnect / onReconnect / addSpectator / removeSpectator → posted, no answer
 //   dispose()                                posted; nothing of this match reaches the lobby afterwards
 //   diag()                                   → Promise of the match's diagnostics (verifyStats, errors, fields — tests,
 //                                            /healthz never)
@@ -24,6 +25,7 @@
 import { ERR } from '../../../shared/constants.js';
 import { msg, wireMessage } from '../../../shared/i18n.js';
 import { validHostMessage } from './ipc.js';
+import { matchRuntimeOptions } from '../Match.js';
 
 /** A request the worker has not answered after this long is answered INTERNAL. [ASSUMED] */
 export const REQUEST_TIMEOUT_MS = 15_000;
@@ -42,8 +44,9 @@ const noopLog = { info() {}, warn() {}, error() {}, debug() {} };
 
 /** The lobby options a worker can take (JSON-safe: no callbacks, no data, no class). */
 export function wireOptions(opts) {
+  opts = matchRuntimeOptions(opts);
   const out = {};
-  for (const k of ['roomCode', 'mode', 'difficulty', 'modeId', 'aiPicksLast', 'seats', 'spectators', 'seed', 'matchNo', 'cs', 'vs', 'requireCs', 'kitted']) {
+  for (const k of ['roomCode', 'mode', 'difficulty', 'modeId', 'aiPicksLast', 'seats', 'runtimeContext', 'spectators', 'seed', 'matchNo', 'cs', 'vs', 'requireCs', 'kitted']) {
     if (opts[k] !== undefined) out[k] = opts[k];
   }
   // A test room must arrive as a test match. Forwarding these only when the flag is set keeps every other
@@ -63,11 +66,13 @@ export class MatchProxy {
    *   host: the worker host (index.js) it posts through; opts: the lobby's Match options (send / broadcast / onEnd used here)
    */
   constructor({ host, matchId, opts, log = noopLog, requestTimeoutMs = REQUEST_TIMEOUT_MS }) {
+    opts = matchRuntimeOptions(opts);
     /** a match in a match host: its answers are Promises, its room's messages go through the room's queue (lobby.js) */
     this.hosted = true;
     this.host = host;
     this.matchId = matchId;
     this.opts = opts;
+    if (opts.runtimeContext) Object.defineProperty(this, 'runtimeContext', { value: opts.runtimeContext, enumerable: true });
     this.log = log;
     this.requestTimeoutMs = requestTimeoutMs;
     this.roomCode = opts.roomCode ?? '----';
@@ -124,7 +129,7 @@ export class MatchProxy {
   cancelSetupReroll(playerId, voteId) { return this._request('cancelSetupReroll', [playerId, voteId]); }
   onDisconnect(playerId) { this._notify('onDisconnect', [playerId]); }
   onReconnect(playerId) { this._notify('onReconnect', [playerId]); }
-  onLeave(playerId) { this._notify('onLeave', [playerId]); }
+  onLeave(playerId) { return this._request('onLeave', [playerId]); }
   /**
    * Host migration. A normal plugin match never posted setHost (the proxy had no such method, so lobby
    * callMatch no-op'd). Only a test match follows the new host, because g.test checks hostId in the worker.

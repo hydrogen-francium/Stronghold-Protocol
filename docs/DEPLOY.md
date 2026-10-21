@@ -1,9 +1,15 @@
 # 部署指南
 
-目标：在一台家用 Windows 小主机上长期开服，让朋友通过局域网或公网来玩。macOS / Linux / Docker 放在后面。
-所有命令都在项目根目录执行。遇到问题先运行 `node tools/doctor.mjs`（只读诊断）。
+本 fork 的目标是单实例长期开服；Windows / macOS / Linux 的原有安装、素材和插件运维说明保留在下方。
+**必须先配置本 fork 的账号认证（§0.1）**，不能直接照上游免配置启动。所有命令均为供服主另行操作的说明，
+在项目根目录执行。最新 Compose 实施及本地定向验证见 [COMPOSE.md](COMPOSE.md)；未执行真实容器部署，
+下方保留的上游测量或历史验证不能代替当前 fork 的生产验收。
+完整契约见 [AUTH.md](AUTH.md)，账号/Admission 是本 fork 有意定制，不是上游 0.3.1 发布功能。
+上游 Releases 整合包或上游 `git clone` 不包含这些定制，不要把它们覆盖到本 fork 后仍当成同一服务。
 
 ## 0. 资源需求
+
+下表保留上游的资源与流量测量，不是本 fork 最新认证集成或全服 16 真人负载的实测结果。
 
 | 项目 | 说明 |
 |---|---|
@@ -13,7 +19,103 @@
 | 磁盘 | 素材约 720 MB（`public/assets`，含中文约 65 MB、日文约 85 MB、英文约 71 MB、韩文约 80 MB、本土语言约 18 MB 的干员语音）+ 依赖约 125 MB（`node_modules`；整合包只带运行依赖，约 65 MB）；可选的本地提取约 40 MB（`.venv-extract`）+ 约 330 MB（贴图、各战场官方场景和官方战斗特效，见第 6 节）。完整包解压后约 1.16 GB。 |
 | 玩家设备 | 支持 WebGL 的现代浏览器（Chrome / Edge / Firefox / Safari 最新版），电脑或手机平板（横屏）。老旧设备可在设置里调低画质或访问 `/?board=2d`。 |
 
-房间和对局只存在内存里，没有数据库和对局存档。重启服务器会结束正在进行的对局（包括断线后本可在 24 小时内回来继续的独立模拟）。自己安装或制作的插件、`plugins/config.json` 和工作台钥匙保存在磁盘上，请按需备份 `plugins/`。
+**持久化边界：**长期账号及 HTTP 会话哈希保存在私有 `<SP_STATE_DIR>/auth.sqlite`，默认状态目录为项目根目录的
+`var/`。房间、对局、游戏 Session/reconnect token 和中央 Admission 仅在内存中；重启即结束所有模拟，账号仍在
+不等于可重启续局或启用云战绩。认证 fork 的断线保留为 **10 分钟，含独立模拟**，不是上游 solo 的 24 小时。
+自己安装/制作的插件、`plugins/config.json`、工作台钥匙仍在 `plugins/`，和账号状态分开备份。
+
+### 0.1 本 fork 必需的认证配置（所有启动方式都适用）
+
+运行环境以 `package.json` 为准：Node **`^22.16.0 || >=24.0.0`**，使用原生 `node:sqlite`，不是任意 Node 22。
+`startServer()` 在监听前校验配置；缺少 Origin/密钥或配置非法就以 `AUTH_CONFIG` 拒绝启动，没有游客/弱密钥生产回退。
+应用**不自动加载 `.env`**，必须让实际 Node 进程继承环境。内部 `authEnv` 和组件的 null-auth 兼容不是免认证开关。
+
+| 变量 | 要求 |
+|---|---|
+| `SP_AUTH_ORIGIN` | 必需，浏览器访问的精确 Origin，例如 `https://game.example.com`；无尾斜杠、路径、查询或片段。不是从 Host / 代理头自动推导。 |
+| `SP_ENTRY_TOKEN` 或 `SP_ENTRY_TOKEN_FILE` | 必需且二选一；准入共享口令，只给受邀玩家，在登录页提交，不放 URL。 |
+| `SP_SESSION_SECRET` 或 `SP_SESSION_SECRET_FILE` | 必需且二选一；独立的服务端秘密，不得与准入口令相同，不给玩家。 |
+| `SP_STATE_DIR` | 绝对、私有、服务用户可写目录，默认 `<项目根>/var`；保存 `auth.sqlite` 及 WAL/SHM。 |
+| `SP_AUTH_ALLOW_HTTP` | 默认 `false`；仅接受 `1` / `true` / `0` / `false`。只给 `localhost` / `127.0.0.1` / `[::1]` 的 HTTP 本机开发放行，**不允许局域网、VPN 或公网 HTTP**。 |
+| `SP_REGISTRATION_OPEN` | 默认 `true`，同上严格布尔值；设为 `false` 只关注册，已有账号仍可登录。 |
+| `SP_BOT_LIMIT` | 全服独立 AI 预算，默认 16，整数 0–256；0 表示不能开含 AI 席位的对局。 |
+
+两份秘密各为 32–512 UTF-8 字节，无首尾空白、控制字符，必须不同。`_FILE` 需要私有绝对路径的普通非符号链接
+文件，允许去掉末尾一个 LF/CRLF。文件/状态目录不得落在任何静态服务根下（包括 `public`、`data`、`shared`、
+`server/sim`、`packs`、`plugins` 或自定义根），不能进入源码归档、镜像上下文、日志、诊断或公开挂载。
+轮换任一秘密会使旧准入授权/游戏访问失效，但不删除账号。
+
+先在操作系统/秘密管理工具中准备互不相同的随机秘密文件并限制权限，再把它们的**路径**交给进程。
+下面只说明变量名和启动关系；路径/域名是占位示例，文件不会由应用示例自动创建，也没有示例口令：
+
+```powershell
+# Windows：先准备这些私有目录/文件和服务用户 ACL；替换域名/绝对路径
+$env:HOST = '127.0.0.1'
+$env:PORT = '3000'
+$env:SP_AUTH_ORIGIN = 'https://game.example.com'
+$env:SP_STATE_DIR = 'C:\Stronghold-private\state'
+$env:SP_ENTRY_TOKEN_FILE = 'C:\Stronghold-private\secrets\entry-token'
+$env:SP_SESSION_SECRET_FILE = 'C:\Stronghold-private\secrets\session-secret'
+$env:SP_STUDIO = 'off'
+node server/index.js
+```
+
+```sh
+# POSIX：私有文件已由部署者准备；反向代理提供下面的 HTTPS Origin
+export HOST=127.0.0.1 PORT=3000
+export SP_AUTH_ORIGIN=https://game.example.com
+export SP_STATE_DIR=/var/lib/stronghold
+export SP_ENTRY_TOKEN_FILE=/etc/stronghold/entry-token
+export SP_SESSION_SECRET_FILE=/etc/stronghold/session-secret
+export SP_STUDIO=off
+node server/index.js
+```
+
+若继承过对应 inline 秘密，使用 `_FILE` 前先移除，不能同时设置两种形式。以上 `HOST=127.0.0.1` 的 HTTP 仅是代理
+后端；玩家必须使用配置的 HTTPS 地址。仅在本机开发时可改成精确 `SP_AUTH_ORIGIN=http://127.0.0.1:3000` 并设
+`SP_AUTH_ALLOW_HTTP=true`，浏览器也须使用同一地址；这不会放行 `http://192.168.*` / `100.*` 等来源。
+
+新建 POSIX 状态目录为 `0700`，数据库及普通 WAL/SHM 为 `0600`；既有父目录不会自动修复。**Windows ACL 不会被
+应用修改**，请服主自行保护状态、秘密及备份并给予实际服务身份所需权限。数据库只存 scrypt 密码记录和
+HTTP-session/CSRF 哈希，不存明文密码/会话凭证，不是战绩数据库。
+
+**人数与部署边界：**只能运行一个权威应用实例，不要开 cluster / PM2 多实例 / 多副本负载均衡；共享 SQLite
+或粘滞连接不会共享内存 Admission。全服按实际开局 roster 的唯一参战 `accountId` 预留 **16 真人**，不是登录数、
+房间容量、IP 或 socket 数；AI 另有默认 16 预算。大厅等待/观战不占，暂断（含 solo）、被淘汰仍保留或 AI 托管
+不提前释放；真实永久离场成功确认或原局结束/失败/销毁清理才幂等释放。当前为 **`MAX_SEATS=16`、协议 2**，
+房间容量为 4/8/16；超过四人的个人库存/机变、重复策略及大报告接管已本地实施，真实多人组合验收另行进行。
+认证版 Compose、素材初始化与排空入口见 [COMPOSE.md](COMPOSE.md)，不能把配置已写好算作容器部署已通过。
+
+**工作台默认关闭。**确需启用时显式设 `SP_STUDIO=lan`、`local` 或 `loopback`；仍须满足原有 peer/所有转发地址、
+Host（及 `SP_STUDIO_HOSTS`）限制和写入 owner key (`X-SP-Studio`)。账号登录不是工作台所有权，额外 Host 白名单
+也不能取消地址门禁。公网生产建议保持关闭；§8 的控制台同样受此约束。
+
+### 0.2 账号维护与备份
+
+实际 CLI 为 `server/auth/admin.js`（本地维护，不开 HTTP，不加载 env）；`<...>` 为待替换参数：
+
+```text
+node server/auth/admin.js --help
+node server/auth/admin.js disable --db <existing-auth.sqlite> --username <username>
+node server/auth/admin.js enable --db <existing-auth.sqlite> --username <username>
+node server/auth/admin.js reset-password --db <existing-auth.sqlite> --username <username>
+node server/auth/admin.js backup --db <existing-auth.sqlite> --output <new-backup-file>
+```
+
+数据库须已初始化、非空、普通非符号链接且为支持的 schema 1；拼错路径不会建库。密码重置只从**非交互 UTF-8
+标准输入**读取新密码，不是终端提示，不支持密码参数/环境变量；末尾一处 LF/CRLF 会移除，有大小/等待时限。
+请用可信本机秘密工具供给，不要把密码写进命令历史。禁用/重置会提高凭证版本并撤销该账号 HTTP 会话；启用
+不会恢复旧会话。在线维护后的 socket 在下次 fresh 验证失效，不依赖旧账号缓存。
+
+`backup` 使用 SQLite 在线一致性备份（含已提交 WAL），独占新输出文件、绝不覆盖已有目标。**不能只复制运行中
+`auth.sqlite` 主文件**而漏掉 WAL；备份同样私有。升级/迁移前保存一致备份及独立秘密配置，停服恢复与可用性需
+另行验证。账号备份不能恢复正在进行的房间，也不包含玩家浏览器里的头像、调配、皮肤、战绩或插件本机数据。
+
+### 0.3 本次验证状态
+
+只有六个基础 auth 套件（`passwords`、`store`、`service`、`admin`、`config`、`admission`）有历史 **86/86** 实跑证据。
+最新 HTTP/Network/Lobby/worker/前端联调、部署、浏览器流程和文档一致性检查均未在本次执行，不能称为已通过。
+下文保留的上游性能/测试实测不证明这个 fork 已完成集成验收。
 
 **房主帮 AI 试算布阵（可选）：**环境变量 `SP_BOT_REHEARSAL` 不设或设为 `server` 时，AI 布阵试算仍在服务器上（默认）。设为 `host` 后，当前房主的浏览器在整备阶段用同源的模块 Worker（`/js/battle/rehearsalWorker.js`，不绘图、不用 `eval`）比较 AI 队友的几种布阵，只把选中的序号发回；服务器直接采用，不再重算。房主掉线、换人、报错、答案不合法或超时（默认 3 秒）时，服务器用同一批候选自己算。整备先结束则取消试算、保留默认布阵，不延长回合。正式战斗和真人「AI 托管」不受影响。开了玩法插件的房间不走这条路：对局在内容组合自己的进程里，仍由服务器试算，避免浏览器用错数据包或绕过脚本额度。没有可用房主时也不会减少服务器负担。浏览器会多算一些，耗时取决于房主设备和局面。这个接口（任务、答案序号、超时、回退到服务器）以后可以换成本机或外部计算，当前版本不会对外发起网络请求。
 
@@ -21,23 +123,26 @@
 
 ### 1.1 安装与首次启动
 
-1. 安装 Node.js 22 LTS 和 Git（在 PowerShell 或「终端」里；用下面的整合包时不需要 Git）：
+本节下载/整合包资料是上游安装参考；运行本 fork 必须使用本 fork 的代码与匹配依赖/素材，不是仅下载上游
+0.3.1 zip 就获得账号服务。先完成 §0.1 的私有配置，再考虑启动脚本；资源准备工具不会替你创建认证秘密。
+
+1. 安装符合 `^22.16.0 || >=24.0.0` 的 Node.js 和 Git（在 PowerShell 或「终端」里；整合包不需要 Git）：
    ```powershell
    winget install OpenJS.NodeJS.LTS
    winget install Git.Git
    ```
-   装完**关闭并重新打开**终端，`node -v` 应显示 v22 或更高（winget 的 LTS 目前是 v24.x，同样可用）。没有 winget 时从 <https://nodejs.org/zh-cn/download> 和 <https://git-scm.com/download/win> 下载安装。
-2. 下载，三选一。建议放在一个固定、短、**不在 OneDrive 同步范围内**的目录，例如 `C:\Stronghold-Protocol`：
+   装完**关闭并重新打开**终端，`node -v` 必须满足上述精确范围（22 至少 22.16.0，或 24 及以上；不是只看主版本 22）。没有 winget 时从 <https://nodejs.org/zh-cn/download> 和 <https://git-scm.com/download/win> 下载安装。
+2. 将本 fork 的源码及匹配依赖/素材放在固定、短、**不在 OneDrive 同步范围内**的目录，例如 `C:\Stronghold-Protocol`。下面三种是**上游获取方式的参考**，不是认证 fork 的下载地址；不要用上游代码覆盖定制：
    - **完整包（推荐）**：在仓库的 [Releases](https://github.com/sganggs/Stronghold-Protocol/releases) 页面下载最新版本的 `Stronghold-Protocol-v<版本>.zip`（约 800 MB，解压后约 1.16 GB；已含运行依赖、前端库和全部素材，包括中文、日文、英文、韩文和本土语言的干员语音和官方 3D 棋盘、各战场官方场景、官方战斗特效等本地客户端素材），解压后把里面的 `Stronghold-Protocol` 文件夹放到上述位置。不需要 Git，首次启动也不用再下载素材。素材版权归上海鹰角网络 / Yostar，仅限非商业使用，见 [NOTICE.md](../NOTICE.md)。
    - **精简包**：同一页面的 `Stronghold-Protocol-v<版本>-lite.zip`（约 25 MB）。代码、运行依赖和前端库与完整包相同，但不带素材：美术、Spine 模型、音频（含全部干员语音）、字体、表情和「玩法说明」教程图在首次启动时由 setup 从公开镜像下载（约 720 MB，显示进度，可中断续传；镜像设置见下面的「国内镜像下载」）。官方 3D 棋盘等本地客户端素材需要用本机客户端提取，或从同一版本的完整包复制（第 6 节）。适合下载大文件不方便、或想先下一个小包的情况；放置方式同完整包。
    - **源码**：
      ```powershell
      git clone https://github.com/sganggs/Stronghold-Protocol.git C:\Stronghold-Protocol
      ```
-3. 双击 `C:\Stronghold-Protocol\scripts\start-windows.bat`。首次会：安装依赖（`npm ci`；整合包已含，跳过）→ 复制前端库（整合包已含，跳过）→ 下载约 550 MB 素材（完整包已含，跳过；精简包和源码在这一步下载，显示进度，中断后再次启动会续传）→ 若检测到本机的明日方舟客户端，询问是否提取官方贴图（可跳过）→ 启动服务器并打开浏览器。
-4. 窗口里会打印朋友可用的地址，例如 `http://192.168.1.23:3000`。用另一台设备打开它确认能进入。关闭窗口即停止服务器。
+3. 先将本 fork 放到固定目录并配置 §0.1，再从**具有这些环境的同一终端**运行 `scripts\start-windows.bat`。它原有的准备流程是：安装依赖（`npm ci`；依赖已含时跳过）→ 复制前端库 → setup 准备素材/可选本机提取 → 启动。资源管理器双击不继承当前 PowerShell 的临时 `$env:`，不能用它替代服务配置；缺项时生产服务应拒绝启动。
+4. 玩家只打开与 `SP_AUTH_ORIGIN` 一致的 HTTPS 地址，先经 `/auth/` 准入并注册/登录，再进入游戏。启动脚本打印的 `http://192.168.*:3000` 是原有网络探测信息，不是本 fork 可用的账号入口。仅本机开发可用 §0.1 的 loopback HTTP 例外。关闭前台窗口即停止服务器，并结束内存中的对局。
 
-等价的手动命令：`npm ci`、`node tools/setup.mjs`、`npm start`。
+手动准备仍可用 `npm ci`、`node tools/setup.mjs`；启动是**带必需配置环境**的 `npm start`（即 `node server/index.js`）。这些包装脚本尚不能视为已完成认证部署向导。
 
 **插件需要的官方数据表（0.3.1）：**完整包和精简包都不内置官方 excel 缓存。只有 Forge 导入要推导名单外官方干员，
 或 setup（包括启动、更新前的缺项检查）发现已安装插件引用这类干员时，才补齐
@@ -76,24 +181,34 @@ $env:SP_ASSET_SOURCE = 'mirror'             # 也可用环境变量显式启用
 
 ### 1.2 防火墙
 
-- 第一次启动时 Windows 会弹出「Windows 安全中心警报」：勾选**专用网络**并点「允许访问」。
-- 没弹窗或点错了，用**管理员** PowerShell 添加规则（下面的开机自启脚本也会自动添加）：
+- 同机 HTTPS 代理配 `HOST=127.0.0.1` 时，不需要让朋友直接连 Node 的 3000 端口；只开放代理实际监听的 HTTPS 入口。Windows 的程序入站提示本身不完成证书、Origin 或账号配置。
+- 如果 HTTPS 代理确实监听 443，可由管理员按实际网络配置添加对应规则，例如（不同代理/端口须另配）：
   ```powershell
-  netsh advfirewall firewall add rule name="Stronghold Protocol" dir=in action=allow protocol=TCP localport=3000 profile=private,domain
+  netsh advfirewall firewall add rule name="Stronghold HTTPS" dir=in action=allow protocol=TCP localport=443 profile=private,domain
   ```
+  原开机自启安装器会为游戏后端端口添加规则，不是本 fork 的 HTTPS 部署向导；须另行审查，不要把后端绑定到公网来迁就它。
 - 家里的网络要是「公用网络」，Windows 会拦截入站连接。改成专用（管理员 PowerShell；网卡名用 `Get-NetConnectionProfile` 查看）：
   ```powershell
   Set-NetConnectionProfile -InterfaceAlias "以太网" -NetworkCategory Private
   ```
-- `node tools/doctor.mjs` 会显示规则是否存在、每个网络的类型，以及朋友可用的地址。
+- `node tools/doctor.mjs` 保留原有规则/网络类型/地址诊断；打印的 HTTP 地址不代表通过本 fork 认证的玩家入口，须使用配置的 HTTPS Origin。
+- 本地认证 smoke 统一用 `node tools/ci.mjs --only smoke`：自选空闲 loopback 端口及临时私有状态/随机秘密，真实准入、注册、登录后检查完整 health、实际游戏 HTML/vendor，再调用严格 doctor；结束会清理自有子进程和状态。它不读取真实账号库，不是 Compose、TLS、公网或浏览器验收。
+- 自动化服务探针可用 `node tools/doctor.mjs --auth-stdin --port <实际端口> --host 127.0.0.1`。该模式只从有界非交互 stdin 接收 `cookie` JSON 字段（必须恰含三种认证 cookie），不从 argv/env/文件取凭据，不进行客户端/防火墙扫描；401、303、匿名最小 health 或空闲端口均不能算成功。不要把真实 cookie 写进命令、日志或仓库；CI smoke 自行通过管道传递其合成凭据。
 
 ### 1.3 固定局域网 IP（推荐）
 
-主机 IP 变了，朋友收藏的地址就失效。推荐在**路由器**后台的「DHCP 静态分配 / 地址保留」里把小主机的 MAC 地址绑定到固定 IP（如 `192.168.1.50`）。也可以在 Windows「设置 → 网络和 Internet → 属性 → IP 分配 → 编辑」里手动设置（IP、子网掩码、网关、DNS 与路由器一致，且不要与别的设备冲突）。
+当路由器转发或另一台机器上的代理依赖后端局域网 IP 时，固定它可避免路由失效；玩家仍收藏配置的 HTTPS Origin，而不是裸 IP/HTTP。可在**路由器**后台的「DHCP 静态分配 / 地址保留」里把小主机的 MAC 地址绑定到固定 IP（如 `192.168.1.50`），或在 Windows「设置 → 网络和 Internet → 属性 → IP 分配 → 编辑」里手动设置（IP、子网掩码、网关、DNS 与路由器一致，且不要与别的设备冲突）。
 
 ### 1.4 开机自动在后台运行
 
-先关闭 `start-windows.bat` 的窗口（否则端口冲突），然后在项目目录运行（会自动请求管理员权限）：
+**认证集成限制：**当前 `install-service-windows.ps1` 只生成 `NODE_EXE`、`PORT`、`HOST`、`SP_COMBAT`、`SP_VERIFY`，
+并以 SYSTEM 任务立即启动；它没有认证参数/私有状态初始化。`run-server.cmd` 会读 `scripts\service.env.cmd`，
+但安装器重跑会重写该文件。下面保留原任务管理用法，**不是可直接使用的认证安装步骤**。先停服，在实际任务/
+服务启动环境中安全提供 §0.1 的必需变量（只放秘密文件路径，不放秘密值），并处理 SYSTEM/服务身份 ACL；
+不要假设用户终端环境或 `.env` 会被任务继承，不要把私有配置写进会被重写/发布的源码文件。未补齐时它会反复
+fail-closed 重启。认证部署包装尚待集成验收，推荐优先使用单一低权限服务身份，而不是依赖此历史 SYSTEM 默认。
+
+先关闭前台服务器窗口（否则端口冲突）。原安装器命令（仅在上述启动环境问题已解决后）：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\install-service-windows.ps1
@@ -113,13 +228,16 @@ powershell -ExecutionPolicy Bypass -File scripts\install-service-windows.ps1
 建议同时关闭睡眠，否则小主机会在无人操作时休眠：`powercfg /change standby-timeout-ac 0`。
 
 <details>
-<summary>替代方案：用 NSSM 注册成真正的 Windows 服务</summary>
+<summary>替代方案：NSSM 的原有服务管理参考（须另供认证环境）</summary>
+
+以下上游命令仅展示服务路径、日志与普通监听配置；`AppEnvironmentExtra` 还须完整提供 §0.1 的 Origin、
+私有状态和秘密文件路径，设置服务身份/ACL 后才能启动。只执行下面的 PORT/HOST 行不能运行本 fork。
 
 ```powershell
 winget install NSSM.NSSM            # 或从 https://nssm.cc 下载
 nssm install StrongholdProtocol "C:\Program Files\nodejs\node.exe" server\index.js
 nssm set StrongholdProtocol AppDirectory C:\Stronghold-Protocol
-nssm set StrongholdProtocol AppEnvironmentExtra PORT=3000 HOST=::
+nssm set StrongholdProtocol AppEnvironmentExtra PORT=3000 HOST=127.0.0.1
 nssm set StrongholdProtocol AppStdout C:\Stronghold-Protocol\logs\server.log
 nssm set StrongholdProtocol AppStderr C:\Stronghold-Protocol\logs\server.log
 nssm start StrongholdProtocol
@@ -129,6 +247,10 @@ nssm start StrongholdProtocol
 </details>
 
 ### 1.5 更新
+
+本 fork 不能直接套用上游发布包/分支覆盖更新；下方是保留的上游更新工具流程，升级来源须由服主确认仍包含
+本 fork 定制。升级前按 §0.2 做一致性账号备份，分别保存私有秘密、插件配置，确认服务身份/环境仍能读取它们。
+停止或重启会结束所有内存对局；浏览器本机资料不在账号 DB。自动任务的重装/重启仍受 §1.4 的配置缺口约束。
 
 ```powershell
 cd C:\Stronghold-Protocol
@@ -140,7 +262,7 @@ node tools/setup.mjs                # 补下载新增的素材（已有文件会
 powershell -ExecutionPolicy Bypass -File scripts\install-service-windows.ps1 -Restart
 ```
 
-没装开机自启的话，最后一步改成重新双击 `start-windows.bat`。
+没装开机自启的话，最后一步改成在具有 §0.1 必需环境的终端重新运行 `scripts\start-windows.bat`，不要假设资源管理器双击会继承临时环境。
 
 #### 用整合包安装的：更新包
 
@@ -153,7 +275,7 @@ Expand-Archive -Force <下载目录>\Stronghold-Protocol-v<版本>-update.zip C:
 powershell -ExecutionPolicy Bypass -File scripts\install-service-windows.ps1 -Restart
 ```
 
-没装开机自启的，最后一步改成双击 `start-windows.bat`。也可以在资源管理器里打开 zip，把其中 `Stronghold-Protocol` 文件夹的全部内容复制到安装文件夹，选「替换目标中的文件」。macOS / Linux：停止服务器后运行 `unzip -o Stronghold-Protocol-v<版本>-update.zip -d <安装文件夹的上一层>`（安装文件夹名为 `Stronghold-Protocol`）；不要用访达拖放，它会把同名文件夹整个替换掉。
+没装开机自启的，最后一步改成在具有 §0.1 必需环境的终端运行 `scripts\start-windows.bat`。也可以在资源管理器里打开 zip，把其中 `Stronghold-Protocol` 文件夹的全部内容复制到安装文件夹，选「替换目标中的文件」。macOS / Linux：停止服务器后运行 `unzip -o Stronghold-Protocol-v<版本>-update.zip -d <安装文件夹的上一层>`（安装文件夹名为 `Stronghold-Protocol`）；不要用访达拖放，它会把同名文件夹整个替换掉。
 
 启动时（双击启动、`npm start`、开机自启的计划任务、NSSM / systemd 都一样）服务器先完成更新：按 `MANIFEST.json` 核对全部程序文件（代码、数据、运行依赖、前端库和说明文档；素材归 setup 管，不在其中），删除 `UPDATE.json` 列出的、新版本不再使用的旧文件（只删内容与旧版本发布时完全一样的文件：自己改过的文件、自己装的内容包、`logs`、`.cache` 都不会动），再把 `UPDATE.json` 改名为 `.update-applied.json`，然后照常启动，日志里有一行「已更新到 v<版本>」。
 
@@ -168,11 +290,11 @@ powershell -ExecutionPolicy Bypass -File scripts\install-service-windows.ps1 -Re
 
 ### 2.1 Tailscale / ZeroTier（推荐给家用小主机）
 
-组一个虚拟局域网：不需要公网 IP、不需要改路由器、不暴露到互联网。
+组一个虚拟局域网可以减少公网暴露，但**不能替代本 fork 的 HTTPS、精确 Origin、准入和账号认证**。
 
-- **Tailscale**：主机和朋友都安装 <https://tailscale.com/download>（Windows：`winget install Tailscale.Tailscale`）并登录。朋友用自己的账号时，在 Tailscale 管理后台把这台主机「Share」给他们，或邀请他们加入你的 tailnet。朋友访问 `http://<主机的 100.x.y.z 地址>:3000`（`tailscale ip -4` 查看；开了 MagicDNS 也可以用 `http://<主机名>:3000`）。
-- **ZeroTier**：在 <https://my.zerotier.com> 创建网络，主机和朋友安装客户端并加入同一个 Network ID，在后台勾选授权成员；访问 `http://<主机的 ZeroTier IP>:3000`。
-- 连不上时运行 `node tools/doctor.mjs`：看 VPN 网卡是否被 Windows 识别为「公用网络」，是的话按 1.2 改为专用，或安装自启时加 `-AllowPublicNetwork`。
+- **Tailscale**：主机和朋友安装 <https://tailscale.com/download> 并在 tailnet / 分享策略中授权。选择稳定的 HTTPS 名称，按所用工具的 HTTPS/反代能力接到本机 HTTP 后端，再令 `SP_AUTH_ORIGIN` 与该 HTTPS 地址精确一致。不要直接用 `http://100.x.y.z:3000` 或 HTTP MagicDNS 名称当账号入口。
+- **ZeroTier**：在 <https://my.zerotier.com> 创建网络并授权设备；同样需要浏览器可信的 HTTPS 入口，不能直接用虚拟网卡的 HTTP 地址登录。
+- VPN 账号不是游戏账号。连通性排错仍检查防火墙/网络类型（1.2），但打开端口不能解除 Origin/认证门禁。
 
 ### 2.2 cloudflared 临时隧道（朋友什么都不用装）
 
@@ -181,23 +303,34 @@ winget install --id Cloudflare.cloudflared      # macOS: brew install cloudflare
 cloudflared tunnel --url http://localhost:3000
 ```
 
-把输出的 `https://xxxx.trycloudflare.com` 发给朋友。页面是 https 时客户端自动改用 `wss://`，不需要任何配置；服务器会通过隧道转发的 `CF-Connecting-IP` 识别真实来源（`TRUST_PROXY=auto`）。临时隧道每次启动地址都不同，且没有可用性保证；需要固定地址请使用 Cloudflare 账号 + 自己域名的「命名隧道」。
+把输出的 `https://xxxx.trycloudflare.com` 作为本次精确 `SP_AUTH_ORIGIN`，连同其他必需配置启动/重启游戏进程后，
+再让朋友访问。页面 HTTPS 会自动使用同源 `wss://`，但**认证 Origin 不是自动配置**；域名更换必须同步修改并
+重启，不能沿用旧值或通配放行。隧道到 loopback 的 HTTP 是后端连接，不需要为公网开启 HTTP 例外。
+服务器原有 `TRUST_PROXY=auto` 可按可信本机代理的转发地址做限流，但不会据此推导或绕过 Origin。临时隧道每次
+地址不同且无可用性保证，长期开服优先稳定的命名隧道/域名；此说明没有验证隧道的实际可用性。
 
-**固定访问地址能省很多流量**：浏览器的缓存、设置、统计和断线令牌都按地址（域名或 IP + 端口）分开保存。地址一换，对玩家来说就是一个新网站：每个人进游戏都要把图片、模型和音频重新下载一遍（第一局约 20–50 MB），设置和本机统计也看不到了。临时隧道每次重启都换域名，所以固定朋友圈子长期开服时，建议用命名隧道、Tailscale（2.1）或固定的公网 IP / 局域网 IP（1.3），让大家一直用同一个地址。
+**固定 HTTPS Origin 能保留本机资料与缓存**：浏览器缓存、Cookie、账号作用域的设置/统计/恢复令牌都按 Origin
+隔离，账号 ID 相同也不会跨 Origin 搬迁。临时隧道换域名即是新网站，需要重新准入/登录并重新取得素材缓存；
+旧头像、调配、皮肤和本机战绩不会因服务器账号还在而自动同步。固定朋友圈子应保持一个稳定 HTTPS 入口和
+匹配的 `SP_AUTH_ORIGIN`，而不是绕开门禁另用 IP/HTTP 地址。
 
 ### 2.3 路由器端口转发
 
 仅当你有**公网 IPv4**（很多宽带是运营商级 NAT，没有公网 IP，此时请用 2.1 / 2.2）：
 
-1. 先按 1.3 固定主机的局域网 IP。
-2. 路由器「虚拟服务器 / 端口转发」：外部端口 3000（或任意端口）→ 内部 `主机IP:3000`，TCP。
-3. 朋友访问 `http://<你的公网 IP>:外部端口`。
+1. 先固定主机局域网地址，在 HTTPS 代理上配置可信证书及稳定入口（§2.4）。
+2. 只转发该 HTTPS 入口所需端口到代理；游戏 HTTP 后端优先绑定 loopback，不把裸 `:3000` 公开给玩家。
+3. 设精确 `SP_AUTH_ORIGIN` 并配置独立秘密/私有状态，再让朋友使用对应 `https://` 地址经准入/账号登录。
 
-注意：游戏没有账号系统，知道地址的人都能进来。服务器对来自互联网的连接有按网络的数量限制（每个网络最多 64 个连接，房间 / 对局数量也有上限），但仍建议不玩时关掉转发，或优先用 Tailscale。
+本 fork 已有账号系统，不再是「知道地址就能进」。按地址的原有 socket/房间/对局防滥用限制仍在，但与按
+真实参战账号的中央 16 真人 Admission 完全不同，也不能替代 HTTPS/认证。只给朋友玩仍优先限制来源或 VPN。
 
 ### 2.4 反向代理与 HTTPS（有域名时）
 
-必须部署在**域名根路径**（客户端使用 `/data/`、`/vendor/`、`/ws` 等绝对路径，不支持挂在子路径下）。代理需要转发 WebSocket 升级（路径 `/ws`）。建议让服务器只监听本机：`HOST=127.0.0.1`（Windows 自启：`-BindHost 127.0.0.1`）。
+必须部署在**域名根路径**（客户端使用 `/data/`、`/vendor/`、`/ws` 等绝对路径，不支持挂在子路径下）。
+代理转发 `/ws` 升级、Cookie、Origin、CSRF 头及响应的 Set-Cookie / CSP / 缓存策略，不要改成另一个浏览器 Origin。
+如下面使用 `game.example.com`，就必须配 `SP_AUTH_ORIGIN=https://game.example.com`。应用本身只提供 HTTP，建议
+`HOST=127.0.0.1`，只让同机 HTTPS 代理访问；`TRUST_PROXY` 只影响可信来源解析，不决定认证 Origin。
 
 **Caddy**（自动申请 HTTPS 证书，WebSocket 无需额外配置）：
 
@@ -236,69 +369,47 @@ server {
 
 **HTTP/2**：客户端由数百个小脚本模块组成（0.2.0 起进入对局时约 340 个），隔着公网时建议让代理以 HTTP/2 提供页面：所有模块走同一条连接，远距离玩家首次进入对局明显更快。Caddy 默认就是 HTTP/2；Nginx 见上面的 `http2`。服务器本身只说 HTTP/1.1，局域网或本机游玩不受影响。HTTP/2 省的是往返等待，不减少字节数。
 
-**压缩**：服务器自己压缩脚本、样式、数据和 Spine 的 `.skel` / `.atlas`：浏览器支持 brotli 时用 brotli（0.2.6 起，质量 5，比 gzip 快且更小：实测 `.skel` 小约 27%、游戏数据 JSON 小约 26%、前端库小约 14%、脚本小约 5%），否则用 gzip；图片和音频本来就是压缩格式，原样发送。浏览器只在 HTTPS 页面（以及 `localhost`）上声明支持 brotli，所以通过代理或隧道的 https 地址访问时用 brotli，局域网里的 `http://192.168.x.x:3000` 这类地址用 gzip。代理不需要另开压缩（Caddy 的 `encode`、Nginx 的 `gzip` 遇到已经压缩的响应会跳过）。
+**压缩**：服务器自己压缩脚本、样式、数据和 Spine 的 `.skel` / `.atlas`：浏览器支持 brotli 时用 brotli（0.2.6 起，质量 5，比 gzip 快且更小：实测 `.skel` 小约 27%、游戏数据 JSON 小约 26%、前端库小约 14%、脚本小约 5%），否则用 gzip；图片和音频本来就是压缩格式，原样发送。浏览器只在 HTTPS 页面（以及 localhost）上声明支持 brotli；本 fork 的非本机玩家本来就须走 HTTPS。代理不需要另开重复压缩（Caddy 的 `encode`、Nginx 的 `gzip` 遇到已经压缩的响应会跳过）。这些历史流量实测不等于最新认证集成验收。
 
-**Cloudflare 缓存**（命名隧道或自己的域名经过 Cloudflare 时）：Cloudflare 默认只缓存常见扩展名，`.skel`、`.atlas` 和没有扩展名的音频地址 `/media/…` 都不在其中，每个请求都会回到开服的电脑。在 Cloudflare 控制台的「缓存规则」里加一条：主机名是你的游戏域名、且 URI 路径以 `/assets/`、`/fonts/` 或 `/media/` 开头时「符合缓存条件」，边缘 TTL 选「使用源站的 Cache-Control」。0.2.6 起素材清单里的地址带内容哈希（`/assets/~<哈希>/…`），服务器给这类地址一年的 `immutable`，换了内容的文件会换地址，所以长期缓存是安全的；`/data/`、页面和脚本不要加进规则（它们要随服务器更新）。注意：边缘公开缓存官方素材会增加被投诉的风险，大量媒体文件也要留意 Cloudflare 的服务条款；只给自己人玩时不加这条规则也可以。
+**Cloudflare / 共享代理缓存**：本 fork 的 `privateResponse` 会为认证服务响应强制 `Cache-Control: private` 并
+`Vary: Cookie`，认证壳/API 另有 no-store。不要沿用上游「把 `/assets/`、`/fonts/`、`/media/` 强制变为边缘公开
+缓存」的规则，不设 Cache Everything / 无视源站私有策略，也不要另开不受认证保护的静态域名。带哈希的素材
+仍可在玩家自己的浏览器里按私有策略缓存；内容不可变不代表可绕开账号门禁。代理须保留 Cookie/Set-Cookie、
+Vary、CSP 和源站缓存指令。使用第三方媒体分发仍需自行考虑版权及服务条款。
 
-https / wss 说明：页面通过 https 打开时客户端自动连接 `wss://同一域名/ws`；http 时用 `ws://`。服务器本身只提供 http，证书由代理 / 隧道负责。代理与服务器在同一台机器或内网时，`TRUST_PROXY=auto` 会信任它的 `X-Forwarded-For` / `X-Real-IP`；代理在公网另一台机器上时设 `TRUST_PROXY=1`（同时确保游戏端口只对代理开放）。
+https / wss：浏览器使用精确配置的 HTTPS Origin，客户端自动连接同源 `wss://…/ws`，证书由代理/隧道负责。
+只有 §0.1 的显式 loopback HTTP 开发例外才使用 `ws://`。代理与后端同机/可信内网时，`TRUST_PROXY=auto` 沿用
+原来源解析；若代理在公网另一台机器上，`TRUST_PROXY=1` 只能在后端端口严格仅对该代理开放时使用。信任代理
+头不是任意 Origin 放行；WebSocket 升级先检查准入/账号 Cookie 和精确 Origin，后续仍 fresh 验证。
 
 ### 2.5 玩家导入已有素材（需要 HTTPS）
 
 标题画面登录框下面并排有两个按钮：「下载完整素材」从这台服务器下载全部素材（打开窗口就开始）；「导入素材包」读取玩家自己的文件夹或 zip，用来少传重复的美术。打开导入窗口不会向服务器请求任何素材，也不会开始下载；真正开始导入时，浏览器只向服务器读取三份素材清单。
 
-- 只有 **HTTPS** 或 **localhost** 能导入。浏览器只在安全上下文里提供 Service Worker 和可用的 Cache Storage。`http://局域网IP:3000` 可以正常玩游戏，也可以用「下载完整素材」，但不能导入；按钮下面和导入窗口里都会说明原因，而不是报错。
+- 只有 **HTTPS** 或 localhost 安全上下文能导入（Service Worker / Cache Storage 的要求）。本 fork 的非本机账号入口必须使用 HTTPS，不能沿用上游「局域网 HTTP 能玩但不能导入」的部署方式。已有素材缓存是设备便利，不提供账号认证或云同步。
 - 玩家导入的是自己已经有的文件：维护者另外提供的素材包 `Stronghold-Protocol-v<版本>-assets.zip`（见第 7 节，不在 GitHub Releases 里），setup 得到的 `public/assets`，或完整发布包 zip。校验通过的文件存在这台浏览器里，并且按地址分开：换了域名或端口就要重新导入。整套素材包约 3.1 万个文件，桌面版 Chrome 导入约 1–2 分钟；zip 分段读取，不会整个读进内存。
 - 和服务器清单里 SHA-256 一致的文件不再向这台服务器请求。整套美术大约 1 GB（下载的约 720 MB，加本地提取的场景和官方战斗特效）；玩家第一局真正用到的通常约 20–50 MB。导入能省下的，是这些本来会从你的机器发出去的字节。哈希对不上的旧版本文件会被拒绝，仍走下载。
 - 导入不经过服务器，服务器日志里看不到这些文件。Service Worker 只回答带内容哈希的 `/assets/`、`/fonts/`、`/media/`。页面、脚本、`/data/`、`/sim/` 和 `/ws` 仍每次走网络。
 
-## 3. Docker
+## 3. Docker 与单实例 Compose
 
-```bash
-# A) 构建时下载素材（需要联网，约 720 MB）
-docker build -t stronghold-protocol --build-arg FETCH_ASSETS=1 .
-docker run -d --name stronghold -p 3000:3000 --restart unless-stopped stronghold-protocol
+正式配置、空卷素材初始化、秘密文件、权限、备份/恢复、升级排空与验收边界统一见
+[COMPOSE.md](COMPOSE.md)。仓库已有 `compose.yaml`、仅 loopback 的 `compose.local.yaml`、Caddy HTTPS 配置及
+独立素材初始化镜像；app 不对外发布端口，账号状态、插件、哈希缓存与 TLS 分卷，素材版本根只读挂载。
 
-# B) 不把素材打进镜像：先在宿主机运行 node tools/setup.mjs，然后挂载
-docker build -t stronghold-protocol .
-docker run -d --name stronghold -p 3000:3000 --restart unless-stopped \
-  -v "$PWD/public/assets:/app/public/assets:ro" stronghold-protocol
-```
+应用基于精确 `node:24.14.1-bookworm-slim` 及 digest，构建只含生产依赖并生成 vendor；
+`FETCH_ASSETS` 构建参数已移除，素材下载/大小/完整 SHA-256/白名单/引用校验失败不会只打 warning 后放行。
+账号 CLI 仍使用 §0.2；健康检查仍是匿名最小 `{ok}`，不是认证或多人验收。
+`/app/plugin-resources` 只读模板与 `/app/plugins` 可写插件卷分离，Studio 和插件脚本默认关闭。
+秘密、旧卷权限与单实例限制不能省略；配置缺失时拒绝启动，不提供游客或弱密码回退。
 
-镜像从源码（`git clone`）构建，Releases 的整合包不含 `Dockerfile`。镜像基于 `node:22-alpine`，多阶段构建，只含生产依赖（包括 `ses@2.3.0` 和 `acorn@8.18.0`）；`public/vendor`（含 `ses.umd.js` / `acorn.mjs`）在构建时生成。`node_modules` 是镜像安装目录里的实际文件，不是指向镜像外的符号链接，脚本沙箱子进程可以在 `--allow-fs-read` 范围内读取。`.dockerignore` 排除了 `public/assets`（不会把宿主机素材打进构建上下文）；`public/fonts`、`data/assets.json` 和 `data/local-assets.json` 若存在会被复制进去。环境变量同 README（`-e SP_VERIFY=sample` 等）。健康检查：`GET /healthz`。
-
-**持久化插件**：把命名卷或宿主机目录挂到 `/app/plugins`，例如加 `-v stronghold-plugins:/app/plugins`。
-镜像在 `/app/plugin-resources` 保留只读的 `_template/`、`README.md` 和 `AGENTS.md`，用
-`SP_PLUGIN_RESOURCES=/app/plugin-resources` 让工作台读取模板；不要把卷挂到这个资源目录。
-即使 `/app/plugins` 是空的，界面和脚本模板仍可用。CLI、Schemas、作者文档和测试助手也在镜像里。
-命名卷首次使用继承目录的 `node` 用户权限；宿主机绑定目录须允许容器里的 `node` 用户写入（工作台钥匙和草稿也写在这里）。
-镜像不会复制构建机器自己的插件、插件打包产物或备份。
-
-脚本模式用 `-e SP_PLUGIN_SCRIPTS=sandbox` 显式开启；默认仍关闭。容器默认监听 `0.0.0.0`，
-原生受信任执行因此必须选择 `trusted-force` 并按第 10 节审查与固定哈希。需要工作台时从本机或局域网地址访问。
-
-Docker Compose 示例（插件命名卷与只读模板分开；脚本默认关闭）：
-
-```yaml
-services:
-  stronghold:
-    build:
-      context: .
-      args: { FETCH_ASSETS: "1" }
-    ports: ["3000:3000"]
-    restart: unless-stopped
-    environment:
-      SP_VERIFY: "off"
-      # SP_PLUGIN_SCRIPTS: sandbox
-    volumes:
-      - stronghold-plugins:/app/plugins
-volumes:
-  stronghold-plugins:
-```
+2026-10-21 本机没有 Docker，故这里只确认代码与配置已实施、定向契约通过；容器构建、真实素材冷启动、
+HTTPS/WS、数据库恢复及资源容量仍须在 Linux 执行，不能把新增 CI 配置写成实际 CI 已通过。
 
 ## 4. macOS / Linux 常驻
 
-- 临时开服：`scripts/start.sh`（或 `npm start`），保持终端窗口打开。macOS 首次会询问是否允许 node 接受传入连接，选「允许」。
-- Linux systemd（`/etc/systemd/system/stronghold.service`，路径与用户按实际修改）：
+- 临时开服：先按 §0.1 在同一进程环境提供全部认证配置，再运行 `scripts/start.sh`（或 `npm start`）；保持终端打开。macOS 的入站提示不等于完成 HTTPS/账号配置。
+- Linux systemd（`/etc/systemd/system/stronghold.service`，路径、域名与用户按实际修改；先创建私有状态/秘密文件，并使 `stronghold` 用户有恰当读写权限，前面部署 HTTPS 代理）：
 
   ```ini
   [Unit]
@@ -309,7 +420,12 @@ volumes:
   [Service]
   WorkingDirectory=/opt/Stronghold-Protocol
   ExecStart=/usr/bin/node server/index.js
-  Environment=PORT=3000 HOST=::
+  Environment=PORT=3000 HOST=127.0.0.1
+  Environment=SP_AUTH_ORIGIN=https://game.example.com
+  Environment=SP_STATE_DIR=/var/lib/stronghold
+  Environment=SP_ENTRY_TOKEN_FILE=/etc/stronghold/entry-token
+  Environment=SP_SESSION_SECRET_FILE=/etc/stronghold/session-secret
+  Environment=SP_STUDIO=off
   Restart=always
   RestartSec=5
   User=stronghold
@@ -318,7 +434,10 @@ volumes:
   WantedBy=multi-user.target
   ```
 
-  `sudo systemctl daemon-reload && sudo systemctl enable --now stronghold`；日志 `journalctl -u stronghold -f`；防火墙 `sudo ufw allow 3000/tcp`。
+  配置中的私有目录/秘密文件须另行准备，此 unit 不自动创建；不要把秘密值写进 unit。也可用服务管理器自己的
+  私有 `EnvironmentFile` 提供同名变量，但这不是应用自动读取 `.env`。确认没有另一个应用实例后再由服主管理：
+  `sudo systemctl daemon-reload && sudo systemctl enable --now stronghold`；日志 `journalctl -u stronghold -f`。
+  只对外开放 HTTPS 代理所需端口，不把 loopback `3000` 改成公网裸 HTTP 来绕过配置。
 
 ## 5. 排错
 
@@ -326,15 +445,21 @@ volumes:
 |---|---|
 | 任何问题 | `node tools/doctor.mjs`：Node 版本、依赖、素材完整性、端口、局域网地址、防火墙、网络类型 |
 | `端口已被占用 / EADDRINUSE` | 已经有一个服务器在运行（自启任务？）或其他程序占用 3000：换端口 `scripts\start-windows.bat --port 3001` |
-| 朋友打不开页面 | 防火墙规则 / 网络类型（1.2）；确认用的是 `LAN` 地址而不是 `localhost`；访客 Wi-Fi 常开启「AP 隔离」；不在同一网络请看第 2 节 |
+| `AUTH_CONFIG` / 启动即退出 | 核对 §0.1 的必需 Origin、不同的两份秘密、inline/FILE 二选一、绝对私有路径、真实服务环境及 Node 范围；只诊断设置名，不输出秘密。应用不会自动读取 `.env` |
+| 准入/登录写入失败、WS 401/4003 | 检查浏览器 Origin 是否精确等于 `SP_AUTH_ORIGIN`、HTTPS/Cookie/CSRF 是否被代理保留，准入/会话是否过期或被维护撤销；回 `/auth/` 重新验证，不通过关闭门禁解决 |
+| `INVALID_RECONNECT` | 显式恢复令牌为空、未知、过期或不属于当前账号；不会创建游客，也不会自动清除令牌。确认账号后选「重新恢复当前账号」，不要把别人令牌或昵称当登录凭证 |
+| `SESSION_IN_USE` / 4001 | 普通 `noReplace:true` 不替换在线页面；只有确认后使用专门的「接管此账号」才会断开旧页，不开自动抢占重试 |
+| `SERVER_FULL` / `ACCOUNT_BUSY` | 中央实际参战 roster 达到真人/AI 预算，或账号已在另一场模拟；不是 IP/socket/房间容量统计。断线、被淘汰仍保留、AI 托管不立刻释放，须真实永久离场确认或原局清理 |
+| 工作台/测试控制台打不开 | fork 默认关闭；确需时显式 `SP_STUDIO=lan`、`local` 或 `loopback`，仍检查原地址、全部转发地址、Host 和 owner key，账号登录不能代替所有权 |
+| 朋友打不开页面 | 检查稳定 HTTPS 入口、精确 Origin 与代理/防火墙（§2），不要让玩家改用未配置的 LAN/HTTP 地址；访客 Wi-Fi 可能有 AP 隔离，VPN 也不取消 HTTPS/账号要求 |
 | 画面是占位图、没有声音 | 素材没下完：重新运行 `node tools/setup.mjs`（会续传）；缺失明细在 `.cache/assets-report.json`。默认仅原始源和 jsDelivr；可用 `--asset-source=mirror` 手动开启前缀镜像（见上文） |
 | 素材下载很慢 / 失败 | 网络问题可随时中断，重新运行会跳过已完成的文件；`node tools/fetch-assets.mjs --concurrency=4` 降低并发。有文件没下载成功时，素材清单 `data/assets.json` 保持不变（脚本列出缺少的条目并以非零状态结束；游戏里缺的图片用占位图，缺的声音不播放），重新运行即可补齐 |
 | 表情显示成默认图标、「玩法说明」只有文字要点 | 素材没下载完整：重新运行 `node tools/setup.mjs`（表情和教程图随其他素材一起从公开镜像下载，不需要客户端）；缺失明细在 `.cache/assets-report.json` |
 | 本地提取失败 | 游戏照常运行，只是第 6 节表格里的几样换成替代样式。确认客户端已下载全部资源；Python 版本太新导致依赖安装失败时，安装 Python 3.12 后删除 `.venv-extract` 再运行 `node tools/setup.mjs --local` |
 | 3D 棋盘没出现 | 需要本地提取的棋盘贴图（`node tools/doctor.mjs` 会显示「3D 棋盘可用」），以及支持 WebGL2 的浏览器。没有客户端的服务器可以从同一版本的整合包复制本地素材（第 6 节） |
 | 素材地址里的 `~` 加一串字母数字 | `/assets/~<哈希>/…` 是 0.2.6 起的带版本地址（见第 0 节「网络」），浏览器可以长期缓存，属于正常现象。怀疑它导致问题时，可以用 `SP_ASSET_INDEX=0` 启动服务器临时关闭（清单改回普通地址），并请在 issue 里说明 |
-| 想知道开服电脑上传了多少流量 | 浏览器打开 `http://localhost:3000/healthz?traffic=1`（换成你的端口）：`traffic.http` 是服务器启动以来各类内容（`assets` 图片和模型、`audio` 音频、`code` 页面和脚本、`data` 游戏数据和素材清单）发出的字节数和请求数（压缩后的实际字节，`notModified` 是只回了「没变」的 304），`traffic.ws` 是 WebSocket 的线上字节（`wireOut` / `wireIn`，压缩后）和压缩前的消息字节（`payloadOut` / `payloadIn`）。数字只在内存里，重启后从 0 开始；只有本机和局域网（含虚拟局域网地址）的访问能看到，公网访问者（包括经隧道 / 反代转发来的）只拿到普通的 `/healthz`。玩家那边：设置 →「问题反馈」复制的诊断里有一行 `traffic:`，是这个页面从打开起下载的字节数（`cached` 是浏览器缓存直接给的，不占流量；`external` 是其他网站，例如 Google 字体） |
-| 断线 | 同盟模拟 10 分钟内、独立模拟 24 小时内（`config.constants.singleReconnectTime`）用同一浏览器重新打开页面，自动回到原座位。同盟掉线期间按原阵容自动作战、到时自动准备（不会代为购买；想让 AI 代打请用「离开模拟 → 暂离（AI 托管）」）；独立模拟不计时，等你回来 |
+| 想知道开服电脑上传了多少流量 | 先在配置的 HTTPS Origin 完成准入/登录，再打开同源 `/healthz?traffic=1`；认证之外还须通过原有本机/私网地址门禁（按 `clientAddress` / `TRUST_PROXY` 识别），登录不绕过该门禁。符合时，`traffic.http` 是服务器启动以来各类内容（`assets` 图片和模型、`audio` 音频、`code` 页面和脚本、`data` 游戏数据和素材清单）发出的字节数和请求数（压缩后的实际字节，`notModified` 是只回了「没变」的 304），`traffic.ws` 是 WebSocket 的线上字节（`wireOut` / `wireIn`，压缩后）和压缩前的消息字节（`payloadOut` / `payloadIn`）。数字只在内存里，重启后从 0 开始；识别为公网的请求只拿普通认证 health，匿名请求即使带 `traffic=1` 也只有最小 `{ok}`。不要切换到未配置的 localhost/HTTP 地址绕过账号要求。玩家那边：设置 →「问题反馈」复制的诊断里有一行 `traffic:`，是这个页面从打开起下载的字节数（`cached` 是浏览器缓存直接给的，不占流量；`external` 是其他网站，例如 Google 字体） |
+| 断线 | 认证 fork 的正常恢复窗为 **10 分钟，含独立模拟**；同账号重新验证后可恢复其保留 Session，在线旧页须显式接管。暂断仍占 Admission；同盟按原阵容自动作战/到时准备，不代买；AI 托管另选。窗口到期发起真实永久离场确认；失败则保守保留名额，原局结束/清理也会释放。账号持久不等于 solo 24 小时、重启续局或云战绩 |
 
 ## 6. 本地客户端素材（可选）
 
@@ -417,15 +542,16 @@ node tools/package.mjs --assets --out <目录>   # 素材包 Stronghold-Protocol
 - 文件改了不用重启：房主下一次操作时（最多每秒检查一次）按新内容生效。写错的字段保持默认值，并在服务器日志里提示一次（`[plugins] …`）。
 - 用了改变玩法插件的房间，对局在单独的子进程里运行（每套内容组合一个，同一组合的房间共用）：开发机实测子进程启动约 0.2 秒，载入数据和对局代码后约占 117 MB 内存（RSS），每个的堆上限 768 MB，最多同时 4 个，空闲 10 分钟后自动结束。子进程卡死（10 秒没有心跳）、崩溃或内存用尽时，只结束这套组合的对局，房间回到大厅并提示原因，服务器和其他房间不受影响。
 - `SP_MATCH_HOST=worker` 改用 worker 线程（在服务器进程里运行，不另起 Node 进程）。**公网服务器不要用**：在 Node 22 上实测，worker 线程里一次性的超大分配用尽内存时，会让**整个服务器进程**退出（`FATAL ERROR: … Allocation failed`，退出码 134），原版房间也一起断开；子进程同样的情况只结束子进程。默认就是子进程（DESIGN §32.6）。
-- `http://localhost:3000/healthz` 的 `content.sets` 是当前在用的改变玩法内容组合数。
+- 在配置的 Origin 完成准入/登录后，同源 `/healthz` 的 `content.sets` 是当前在用的改变玩法内容组合数；匿名 health 只有最小 `{ok}`，该数值也不是 Admission 参战名额。
 - 按地址安装（[PLUGINS.md](PLUGINS.md) §17）只接受公网 https 的 443 端口，并且必须校验 zip 的 SHA-256；服务器下载后先检查再放入 `plugins/`，不执行包里的任何代码。内网、本机、链路本地和 `.local` 默认拒绝，重定向到这些地址或离开 https 也会拒绝。一次等待包含正文，不是每一跳重新计时。服主要放行某个主机，写在上面的 `allowDownloadHosts` 或 `SP_PLUGIN_DOWNLOAD_ALLOW` 里。
 - 有人反馈问题时，诊断信息里的 `content:` 一行写着房间用的内容（`MODDED cs=… plugins=…` 表示开了改变玩法的插件），问题模板也会问「是否开了插件」。插件房间的问题请先找插件作者，并尽量在原版里复现。
 
 
 ### 测试控制台（0.3.1）
 
-从本机或局域网打开插件工作台，使用启动窗口里的同一把钥匙，点击顶栏「测试控制台」；也可访问
-`/studio/console.html`。它沿用工作台的访问限制和 `SP_STUDIO=off` 关闭开关，不新增端口。
+须先显式启用 Studio（本 fork 默认关闭，见 §0.1），再从满足原地址/Host 门禁的访问路径打开工作台，使用
+启动窗口里的同一把 owner key，点击顶栏「测试控制台」，或访问 `/studio/console.html`。游戏账号登录不提供
+工作台所有权；`SP_STUDIO=off` 保持关闭，不新增端口。
 场景在服务器校验，战斗在浏览器运行，不创建对局、不记战绩，也不修改普通房间。场景只保存在浏览器，
 需长期保存或迁移时下载 JSON。操作见 [插件新手指南](PLUGIN-GUIDE.md#测试控制台)。
 
@@ -463,7 +589,8 @@ Node 22 权限模型不是恶意代码安全边界，且不限制网络。SES/V8
 [Node 22 permissions](https://nodejs.org/docs/latest-v22.x/api/permissions.html)。
 
 整站默认发送 CSP，覆盖主页、开发页面和 `/studio/`；importmap 用精确内容的 SHA-256 放行，页面没有 unsafe-eval。
-字体保留 Google Fonts 域名，样式允许 unsafe-inline，图片允许 data/blob，WebSocket 与同源连接以及 blob Worker
+CSP 仍保留原 Google Fonts 域名白名单，但本 fork 的默认主页/UI gallery 只加载同源字体 CSS 和系统 CJK 回退，
+不再自动请求远程字体样式；没有为测试中出现的未知 `font.im` 来源扩域。样式允许 unsafe-inline，图片允许 data/blob，WebSocket 与同源连接以及 blob Worker
 保留。Pixi 使用无动态求值的 uniform 适配器。服主可设 `SP_CSP=off` 关闭整站策略 [ASSUMED]；界面插件 `/p/` 和
 模拟 Worker 自己的 CSP 不随此开关关闭。整站 connect-src 仅保留 'self'，现有同源 WebSocket 仍可连接。反向代理应保留 CSP 响应头，不要额外叠加会阻断 importmap 或 Worker 的策略。
 Worker 响应单独允许 unsafe-eval 供 SES evaluate 使用，并设 `connect-src 'none'`。

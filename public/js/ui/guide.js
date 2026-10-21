@@ -132,7 +132,7 @@ export function GuideHost() {
   useEffect(() => {
     if (!open) return undefined;
     const onKey = (e) => {
-      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      if (document.querySelector('.modal--priority') || e.ctrlKey || e.metaKey || e.altKey) return;
       const k = e.key;
       let handled = true;
       if (k === 'Escape') closeGuide();
@@ -144,7 +144,9 @@ export function GuideHost() {
       if (handled) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); }
     };
     window.addEventListener('keydown', onKey, true);
-    const t = setTimeout(() => boxRef.current?.focus?.(), 30);
+    const t = setTimeout(() => {
+      if (!document.querySelector('.modal--priority')) boxRef.current?.focus?.();
+    }, 30);
     return () => { window.removeEventListener('keydown', onKey, true); clearTimeout(t); };
   }, [open, n]);
 

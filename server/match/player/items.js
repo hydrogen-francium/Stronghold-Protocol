@@ -11,16 +11,17 @@ import { offsetTile } from '../../sim/dir.js';
 import { itemKey } from '../gamedata.js';
 import { OK, fail } from './common.js';
 
+/** 玩家装备操作与移除记账；销毁、消耗和淘汰释放各自库存，不转移他人的透支。 */
 export class PlayerItems {
   /**
-   * A copy that actually leaves the match repays shared-item debt first (#624). Equipping, selling a carrier
-   * (the item returns to the hand) and a merge that keeps the golden do not call this.
+   * 给定物品实际离局时偿还所属装备池的透支，返回偿还副本数（#624）。
+   * 装备转移、出售载体后回手以及保留高级装备的合成不释放库存。
    * @param {any} piece
-   * @returns {number} copies repaid
+   * @returns {number} 已偿还的副本数
    */
   releaseItemStock(piece) {
-    if (!piece || piece.kind !== 'item' || !this.m?.itemPool) return 0;
-    return this.m.itemPool.repay(piece.id, this.m.itemPool.need(piece.id));
+    if (!piece || piece.kind !== 'item') return 0;
+    return this.itemPool.repay(piece.id, this.itemPool.need(piece.id));
   }
 
   /**

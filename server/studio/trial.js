@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { childEnvironment } from '../auth/child-env.js';
 import { isPluginId } from '../../shared/plugins/manifest.js';
 import { StudioError } from './files.js';
 
@@ -39,7 +40,7 @@ export function createTrialBench({ registry, files, spawn = fork, limits = TRIAL
         if (child?.pid && !exited) child.once('exit', cleaned);
         if (child?.pid) {
           // Probe/runner descendants inherit this group. Kill them even if the leader already exited.
-          if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { timeout: 5000, windowsHide: true, stdio: 'ignore' });
+          if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { env: childEnvironment(), timeout: 5000, windowsHide: true, stdio: 'ignore' });
           else try { process.kill(-child.pid, 'SIGKILL'); } catch { /* group already gone */ }
         }
         try { child?.kill('SIGKILL'); } catch { /* already exited */ }
@@ -50,7 +51,7 @@ export function createTrialBench({ registry, files, spawn = fork, limits = TRIAL
       try {
         if (request.draft) temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'sp-studio-trial-'));
         child = spawn(fileURLToPath(new URL('./trialChild.js', import.meta.url)), [], {
-          detached: true, execArgv: [`--max-old-space-size=${limits.heapMb}`],
+          env: childEnvironment(), detached: true, execArgv: [`--max-old-space-size=${limits.heapMb}`],
           stdio: ['ignore', 'ignore', 'ignore', 'ipc'], serialization: 'json',
         });
         timer = setTimeout(() => finish(new StudioError('PLUGIN_STUDIO_TRIAL_TIMEOUT', 504)), limits.timeoutMs);

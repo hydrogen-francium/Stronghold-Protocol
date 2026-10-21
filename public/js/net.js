@@ -20,11 +20,8 @@
 // - Server clock offset (serverNow ≈ Date.now() + offset) from pong samples (lowest RTT wins),
 //   bootstrapped from `welcome.serverNow` / `m.public.serverNow`.
 //
-// Identity persistence (`identity`, see the section at the end): the name lives in localStorage;
-// the reconnect token lives in sessionStorage (survives reloads of this tab) plus a short list of
-// recent tokens in localStorage (resume after closing/reopening the tab). `identity.init()` asks
-// the other live tabs over a BroadcastChannel which tokens they hold, so a second or duplicated tab
-// of the same browser becomes a separate player instead of hijacking another tab's session.
+// Identity persistence is account-scoped. A second tab claims the same account and is refused
+// by default; only an explicit user action may set hello.takeover. No guest identity is allocated.
 //
 // Shared modules are imported relatively: in the browser '../../shared/x.js' from /js/ resolves
 // to /shared/x.js (URL resolution clamps at the root); under Node it resolves to <repo>/shared.
@@ -47,12 +44,16 @@ export const CLIENT_ERR_TEXT = Object.freeze({
   CLOSED: N_('连接已关闭'),
   REPLACED: N_('该身份已在其他页面登录'),
   VERSION: N_('客户端版本与服务器不一致，请刷新页面'),
+  ACCOUNT_MISMATCH: N_('账号已改变，请重新验证后进入游戏'),
 });
 
 /** Server close code: the session was taken over by another socket (server/net.js CLOSE.REPLACED). */
 export const CLOSE_REPLACED = 4001;
 /** Server close code: the socket never sent `hello` (server/net.js CLOSE.HELLO_TIMEOUT, ~30–60 s). */
 export const CLOSE_HELLO_TIMEOUT = 4002;
+/** Server-side cookie/session revocation: never retry under a stale account. */
+export const CLOSE_AUTH_REQUIRED = 4003;
+const ACCOUNT_ID = /^a_[0-9a-f]{32}$/;
 /** A pre-hello socket must have lived this long before a 4002 close is swapped quietly (no loop). */
 const QUIET_SWAP_MIN_AGE_MS = 5000;
 
@@ -115,6 +116,7 @@ export class Net {
    * @param {any} [opts.WebSocket] WebSocket constructor (default: globalThis.WebSocket)
    * @param {() => (string|null)} [opts.getToken] reconnect-token provider for `hello`
    * @param {() => ({ noReplace: boolean, claimAt?: number })} [opts.getTokenClaim] local ownership for this hello
+   * @param {() => (string|null)} [opts.getAccountId] currently verified identity owner; mismatches stop the document
    * @param {() => number} [opts.now]
    * @param {() => number} [opts.random]
    * @param {{setTimeout: Function, clearTimeout: Function, setInterval: Function, clearInterval: Function}} [opts.timers]
@@ -124,6 +126,13 @@ export class Net {
     this.WS = opts.WebSocket || null;
     this.getToken = typeof opts.getToken === 'function' ? opts.getToken : () => null;
     this.getTokenClaim = typeof opts.getTokenClaim === 'function' ? opts.getTokenClaim : () => null;
+    this.getAccountId = typeof opts.getAccountId === 'function' ? opts.getAccountId : () => this.accountId;
+    this.accountId = null;
+    this._documentAccountId = null;
+    this._socketAccountId = null;
+    this._helloAccountId = null;
+    this._authBlocked = false;
+    this._takeoverNext = false;
     this.now = opts.now || (() => Date.now());
     this.random = opts.random || Math.random;
     this.timers = opts.timers || {
@@ -211,8 +220,47 @@ export class Net {
 
   // ---- lifecycle -------------------------------------------------------------------------------
 
+  /** One verified account per document. Binding never reads or fabricates an authentication cookie. */
+  setAccount(account) {
+    const id = typeof account === 'string' ? account : account?.id;
+    if (id == null) {
+      this._authBlocked = true;
+      this.close(); this.accountId = null; this.playerId = null; this.name = null;
+      this.helloName = null; this.serverName = null; return;
+    }
+    if (typeof id !== 'string' || !ACCOUNT_ID.test(id)) throw new Error('Invalid account binding');
+    if (this._documentAccountId && this._documentAccountId !== id) {
+      this._authenticationLost('ACCOUNT_MISMATCH');
+      throw new Error('Account changes require a page reload');
+    }
+    this._documentAccountId = id; this.accountId = id;
+  }
+
+  _accountMatches() {
+    return ACCOUNT_ID.test(this.accountId || '') && this.getAccountId() === this.accountId;
+  }
+
+  _authenticationLost(code = 'AUTH_REQUIRED') {
+    if (this._authBlocked) { this._failPending(code, true); return; }
+    this._authBlocked = true;
+    this.close();
+    this.accountId = null; this.playerId = null; this.name = null; this.helloName = null;
+    this.lastError = new NetError(code);
+    this._emit('status', this.snapshot());
+    this._emit('authRequired', this.lastError);
+  }
+
+  /** This method is called only by the clearly labelled account takeover button. */
+  takeOver(name = this.name) {
+    if (!this._accountMatches() || this._authBlocked) return false;
+    this.name = name; this._takeoverNext = true; this._manualClose = false;
+    this.reconnectNow(name); return true;
+  }
+
   /** Open the socket (no-op when already open/connecting). Also resumes after close()/replacement. */
   connect() {
+    if (this._authBlocked) return;
+    if (!this._accountMatches()) { this._authenticationLost('ACCOUNT_MISMATCH'); return; }
     const quiet = this._quietSwap;
     this._quietSwap = false;
     if (this.ws && (this.ws.readyState === WS_OPEN || this.ws.readyState === WS_CONNECTING)) return;
@@ -230,6 +278,7 @@ export class Net {
       return;
     }
     this.ws = ws;
+    this._socketAccountId = this.accountId;
     if (!quiet) this._setStatus(this.attempt > 0 ? 'reconnecting' : 'connecting');
     ws.onopen = () => { if (ws === this.ws) this._onOpen(); };
     ws.onmessage = (ev) => { if (ws === this.ws) this._onMessage(ev?.data); };
@@ -240,6 +289,7 @@ export class Net {
   /** Close for good (no reconnect). Pending requests reject with CLOSED. */
   close() {
     this._manualClose = true;
+    this._takeoverNext = false;
     this._clearTimer('_reconnectTimer', 'clearTimeout');
     this.retryAt = 0;
     const ws = this.ws;
@@ -290,6 +340,7 @@ export class Net {
   }
 
   _onOpen() {
+    if (!this._accountMatches() || this._socketAccountId !== this.accountId) { this._authenticationLost('ACCOUNT_MISMATCH'); return; }
     this._openedAt = this.now();
     this._lastRx = this._openedAt;
     this._unansweredSince = null;
@@ -307,6 +358,8 @@ export class Net {
 
   _onClose(ev) {
     this._teardownSocket();
+    if (ev?.code === CLOSE_AUTH_REQUIRED) { this._authenticationLost(); return; }
+    if (!this._accountMatches()) { this._authenticationLost('ACCOUNT_MISMATCH'); return; }
     this._failPending('DISCONNECTED', false);
     if (this._manualClose) { this._setStatus('closed'); return; }
     if (ev && ev.code === CLOSE_REPLACED) {
@@ -365,17 +418,21 @@ export class Net {
 
   _sendHello() {
     if (!this.name) return;
+    if (!this._accountMatches() || this._socketAccountId !== this.accountId) { this._authenticationLost('ACCOUNT_MISMATCH'); return; }
     const rid = this._nextRid();
-    const msg = { t: 'hello', rid, name: this.name, version: PROTOCOL_VERSION };
+    const takeover = this._takeoverNext;
+    const msg = { t: 'hello', rid, name: this.name, version: PROTOCOL_VERSION, noReplace: !takeover };
+    if (takeover) { msg.takeover = true; this._takeoverNext = false; }
     let token = null;
     try { token = this.getToken(); } catch { token = null; }
     if (typeof token === 'string' && token.length > 0 && token.length <= 64) {
       msg.token = token;
       const claim = this.getTokenClaim();
-      if (claim?.noReplace) msg.noReplace = true;
+      if (!takeover && claim?.noReplace) msg.noReplace = true;
       if (Number.isFinite(claim?.claimAt)) msg.claimAt = claim.claimAt;
     }
     this._helloToken = token;
+    this._helloAccountId = this.accountId;
     this._helloRid = rid;
     this._helloSentName = this.name;
     if (this.status !== 'handshaking') this._setStatus('handshaking');
@@ -394,6 +451,10 @@ export class Net {
   }
 
   _onWelcome(msg) {
+    if (!this._accountMatches() || this._socketAccountId !== this.accountId
+        || this._helloAccountId !== this.accountId || msg.account?.id !== this.accountId) {
+      this._authenticationLost('ACCOUNT_MISMATCH'); return;
+    }
     this._clearTimer('_helloTimer', 'clearTimeout');
     this._helloRid = null;
     // Compare future setName() calls against what we sent (the server may normalise the name).
@@ -409,11 +470,18 @@ export class Net {
   }
 
   _onHelloError(msg) {
+    if (msg.code === 'AUTH_REQUIRED' || msg.code === 'ACCOUNT_MISMATCH') { this._authenticationLost(msg.code); return; }
     this._clearTimer('_helloTimer', 'clearTimeout');
     this._helloRid = null;
     this.lastError = new NetError(msg.code, msg.msg, msg.detail);
-    this._setStatus('connected');
-    // Queued requests can't be sent without a session.
+    // Bad reconnects and a live account in another tab require an explicit user choice.
+    if (msg.code === 'INVALID_RECONNECT' || msg.code === 'SESSION_IN_USE') {
+      const ws = this.ws;
+      this._teardownSocket(); this._manualClose = true; this.retryAt = 0;
+      this._clearTimer('_reconnectTimer', 'clearTimeout');
+      try { ws?.close(1000, 'account recovery required'); } catch { /* ignore */ }
+      this._setStatus('closed');
+    } else this._setStatus('connected');
     this._failPending('OFFLINE', true);
     this._emit('helloError', this.lastError);
   }
@@ -436,6 +504,9 @@ export class Net {
    */
   request(t, fields = {}, opts = {}) {
     return new Promise((resolve, reject) => {
+      if (!this._accountMatches() || this._authBlocked) {
+        this._authenticationLost('ACCOUNT_MISMATCH'); reject(new NetError('ACCOUNT_MISMATCH')); return;
+      }
       if (t === 'hello') { reject(new NetError('BAD_MSG', 'use setName() for hello')); return; }
       const rid = this._nextRid();
       const msg = { ...(fields && typeof fields === 'object' ? fields : {}), t, rid };
@@ -452,7 +523,7 @@ export class Net {
         return;
       }
       const timeout = Number.isFinite(opts.timeout) && opts.timeout > 0 ? opts.timeout : REQUEST_TIMEOUT_MS;
-      const entry = { msg, resolve, reject, sent: false, timer: null };
+      const entry = { msg, resolve, reject, sent: false, timer: null, accountId: this.accountId };
       entry.timer = this.timers.setTimeout(() => {
         if (this._pending.get(rid) !== entry) return;
         this._pending.delete(rid);
@@ -474,6 +545,7 @@ export class Net {
    * @returns {boolean}
    */
   send(t, fields = {}) {
+    if (!this._accountMatches() || this._authBlocked) { this._authenticationLost('ACCOUNT_MISMATCH'); return false; }
     if (t === 'hello') return false;
     const msg = { ...(fields && typeof fields === 'object' ? fields : {}), t };
     const bad = validateC2S(msg);
@@ -495,7 +567,13 @@ export class Net {
   }
 
   _flushQueue() {
-    for (const entry of this._pending.values()) {
+    if (this._manualClose || !this._accountMatches() || this._socketAccountId !== this.accountId) {
+      this._failPending('ACCOUNT_MISMATCH', true); return;
+    }
+    for (const [rid, entry] of [...this._pending]) {
+      if (entry.accountId !== this.accountId) {
+        this._pending.delete(rid); this._clearEntryTimer(entry); entry.reject(new NetError('ACCOUNT_MISMATCH')); continue;
+      }
       if (!entry.sent) entry.sent = this._sendRaw(entry.msg);
     }
   }
@@ -528,6 +606,7 @@ export class Net {
   // ---- incoming --------------------------------------------------------------------------------
 
   _onMessage(data) {
+    if (!this._accountMatches() || this._socketAccountId !== this.accountId) { this._authenticationLost('ACCOUNT_MISMATCH'); return; }
     this._lastRx = this.now();
     this._unansweredSince = null;
     let msg;
@@ -539,14 +618,21 @@ export class Net {
     }
     if (!msg || typeof msg !== 'object' || Array.isArray(msg) || typeof msg.t !== 'string') return;
     const { t } = msg;
+    if (t === 'error' && (msg.code === 'AUTH_REQUIRED' || msg.code === 'ACCOUNT_MISMATCH')) {
+      this._authenticationLost(msg.code); return;
+    }
     const rid = msg.rid;
     const isHelloError = t === 'error' && rid != null && rid === this._helloRid;
 
     if (t === 'welcome') {
-      // A local ownership election can revoke a token after its hello went onto the wire.
-      // Do not publish or persist that stale welcome, even if the server had already accepted it.
+      // Authenticate BEFORE status=online, publishing the welcome or flushing any queued game request.
+      if (!this._accountMatches() || this._socketAccountId !== this.accountId
+          || this._helloAccountId !== this.accountId || msg.account?.id !== this.accountId) {
+        this._authenticationLost('ACCOUNT_MISMATCH'); return;
+      }
       if (this._helloToken !== this.getToken()) { this.reconnectNow(); return; }
       this._onWelcome(msg);
+      if (this._manualClose || !this._accountMatches() || this.status !== 'online') return;
     } else if (t === 'pong') {
       this._onPong(msg);
     } else if (isHelloError) {
@@ -585,6 +671,7 @@ export class Net {
   _heartbeat() {
     const ws = this.ws;
     if (!ws || ws.readyState !== WS_OPEN) return;
+    if (!this._accountMatches() || this._socketAccountId !== this.accountId) { this._authenticationLost('ACCOUNT_MISMATCH'); return; }
     const live = this.status === 'online' || this.status === 'connected';
     if (live && this._unansweredSince != null && this.now() - this._unansweredSince > DEAD_AFTER_MS) {
       console.warn('[net] connection silent; reconnecting');
@@ -656,313 +743,169 @@ export class Net {
   }
 }
 
-// ---- identity persistence -------------------------------------------------------------------------
-//
-// Which reconnect token a tab uses is decided once per page load by `identity.init()`:
-//   1. this tab's own token (sessionStorage: survives reloads of this tab),
-//   2. else the most recent token of this browser (localStorage, so closing the tab and reopening
-//      the game within the server's reconnect window resumes the seat),
-// skipping every token that another *live* tab of this browser is using. Liveness is asked over a
-// BroadcastChannel ('who holds these token hashes?' → 'mine'), not inferred from timer heartbeats:
-// browsers throttle background-tab timers to ~1/min, which would make a busy background tab look
-// dead. A duplicated tab (sessionStorage is copied) therefore drops the copied token and becomes a
-// new player instead of kicking the original tab off its session (server close 4001). Two tabs
-// resolving shared candidates at the same moment tie-break on tab id. An existing session token
-// never falls back to another recent identity. Its welcome stamp survives reload; an earlier
-// welcome outranks a later claimant, then a live holder wins over its duplicate, then tab id.
-// Without BroadcastChannel a tab only ever uses
-// its own token (never another tab's), so it can't steal a live session either.
-
-const K_NAME = 'sp.name';
-const K_TOKEN = 'sp.token';      // sessionStorage: this tab's token
-const K_WELCOME = 'sp.tokenWelcome'; // sessionStorage: { hash, at } from the first welcome for this token
-const K_RECENT = 'sp.tokens';    // localStorage: this browser's recent tokens, most recent first
-const K_MATCHES = 'sp.matches'; // local metadata for explicit recovery of another closed tab's seat
-const K_ENTERED = 'sp.entered';  // sessionStorage: this tab passed the title screen
+// ---- account-scoped identity persistence ----------------------------------------------------------
+// Reconnect tokens are game-session claims, NOT authentication credentials. Nothing is read until
+// setAccount() receives the verified HTTP identity. Old sp.* guest data is never adopted.
 const RECENT_MAX = 4;
-const TOKEN_MAX_LEN = 64;        // protocol limit for hello.token
-const CHANNEL_NAME = 'sp.identity';
-/** How long init() waits for other tabs to claim a candidate token (ms). */
-export const CLAIM_QUERY_MS = 150;
-
-function safeStorage(kind) {
-  try {
-    const s = globalThis[kind];
-    if (!s) return null;
-    const probe = '__sp_probe__';
-    s.setItem(probe, '1');
-    s.removeItem(probe);
-    return s;
-  } catch {
-    return null;
-  }
-}
-
-function sget(s, k) { try { return s ? s.getItem(k) : null; } catch { return null; } }
-function sset(s, k, v) { try { if (s) s.setItem(k, v); } catch { /* quota / privacy mode */ } }
-function sdel(s, k) { try { if (s) s.removeItem(k); } catch { /* ignore */ } }
-
+const TOKEN_MAX_LEN = 64;
+const RECOVERY_NOTICE = Object.freeze({
+  match: N_('服务器会话已重置，上一局模拟已结束'),
+  room: N_('服务器会话已重置，已返回大厅'),
+});
+export const CLAIM_QUERY_MS = 150; // compatibility export; no BroadcastChannel guest election remains
+function safeStorage(kind) { try { return globalThis[kind] || null; } catch { return null; } }
+function sget(s, k) { try { return s && k ? s.getItem(k) : null; } catch { return null; } }
+function sset(s, k, v) { try { if (s && k) s.setItem(k, v); } catch { /* quota / privacy mode */ } }
+function sdel(s, k) { try { if (s && k) s.removeItem(k); } catch { /* ignore */ } }
 const isToken = (t) => typeof t === 'string' && t.length > 0 && t.length <= TOKEN_MAX_LEN;
 
-/**
- * Short, stable hash of a token (FNV-1a, hex) so tabs never broadcast tokens in clear.
- * @param {string} token
- * @returns {string}
- */
+/** Stable token metadata ID; no cleartext token is used as a display identifier. */
 export function tokenHash(token) {
   let h = 2166136261;
   const s = String(token);
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619) >>> 0;
-  }
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; }
   return h.toString(16).padStart(8, '0');
 }
 
-function defaultChannel() {
-  try {
-    return typeof globalThis.BroadcastChannel === 'function' ? new globalThis.BroadcastChannel(CHANNEL_NAME) : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Create the identity helper (nickname, "entered" flag and reconnect-token selection; see above).
- * @param {{ local?: Storage|null, session?: Storage|null, tabId?: string,
- *           channel?: { postMessage: Function, addEventListener?: Function, onmessage?: any } | null,
- *           setTimeout?: (fn: Function, ms: number) => any, queryMs?: number, now?: () => number,
- *           onYield?: () => void }} [deps]
- */
+/** No storage access (even probing) or channels during module evaluation. */
 export function createIdentity(deps = {}) {
-  const local = deps.local !== undefined ? deps.local : safeStorage('localStorage');
-  const session = deps.session !== undefined ? deps.session : safeStorage('sessionStorage');
-  const tabId = deps.tabId || Math.random().toString(36).slice(2) + Date.now().toString(36);
-  const setTimer = deps.setTimeout || ((fn, ms) => globalThis.setTimeout(fn, ms));
+  let local = null, session = null;
+  let accountId = null, documentAccountId = null;
+  let keys = null;
+  let current = null, welcomeAt = null, initialized = false, recovery = null;
   const now = deps.now || (() => Date.now());
-  const queryMs = Number.isFinite(deps.queryMs) && deps.queryMs >= 0 ? deps.queryMs : CLAIM_QUERY_MS;
-
-  let channel = null;
-  let initPromise = null;
-  let initialized = false;
-  let resumeBusy = false;
-  let current = null;    // token this tab uses (null = let the server create a session)
-  let resolving = null;  // { hashes: Set<hash>, taken: Set<hash> } while init() waits for claims
-  let owned = sget(session, K_TOKEN);
-  if (!isToken(owned)) owned = null;
-  let welcomeAt = null;
-  try {
-    const saved = JSON.parse(sget(session, K_WELCOME) || 'null');
-    if (owned && saved?.hash === tokenHash(owned) && Number.isFinite(saved.at) && saved.at >= 0) welcomeAt = saved.at;
-  } catch { /* old / damaged storage: the session token still claims its seat */ }
-  let welcomed = false; // this document has received welcome (a copied stamp alone is not a live holder)
-
-  const readRecent = () => {
+  const readRecovery = () => {
     try {
-      const v = JSON.parse(sget(local, K_RECENT) || '[]');
-      return Array.isArray(v) ? v.filter(isToken) : [];
-    } catch {
-      return [];
-    }
+      const value = JSON.parse(sget(session, keys?.recovery) || 'null');
+      if (value?.v !== 1 || !(value.previousPlayerId === null
+        || (typeof value.previousPlayerId === 'string' && value.previousPlayerId.length > 0 && value.previousPlayerId.length <= 64))
+        || ![null, 'match', 'room'].includes(value.notice)) return null;
+      return { v: 1, previousPlayerId: value.previousPlayerId, notice: value.notice };
+    } catch { return null; }
   };
-  const writeRecent = (list) => sset(local, K_RECENT, JSON.stringify([...new Set(list)].slice(0, RECENT_MAX)));
-
+  const readRecent = () => {
+    if (!keys) return [];
+    try { const value = JSON.parse(sget(local, keys.recent) || '[]'); return Array.isArray(value) ? value.filter(isToken) : []; }
+    catch { return []; }
+  };
+  const writeRecent = (list) => { if (keys) sset(local, keys.recent, JSON.stringify([...new Set(list)].slice(0, RECENT_MAX))); };
   const readMatches = () => {
-    try {
-      const v = JSON.parse(sget(local, K_MATCHES) || '{}');
-      return v && typeof v === 'object' && !Array.isArray(v) ? v : {};
-    } catch { return {}; }
+    if (!keys) return {};
+    try { const value = JSON.parse(sget(local, keys.matches) || '{}'); return value && typeof value === 'object' && !Array.isArray(value) ? value : {}; }
+    catch { return {}; }
   };
   const rememberMatch = (info) => {
-    if (!current) return;
+    if (!keys || !current) return;
     const old = readMatches(), next = {};
     for (const token of readRecent()) {
-      const hash = tokenHash(token);
-      const v = token === current ? info : old[hash];
-      if (v && typeof v.name === 'string' && typeof v.code === 'string') {
-        next[hash] = { name: v.name.slice(0, 64), code: v.code.slice(0, 32) };
-      }
+      const hash = tokenHash(token), value = token === current ? info : old[hash];
+      if (value && typeof value.name === 'string' && typeof value.code === 'string') next[hash] = { name: value.name.slice(0, 64), code: value.code.slice(0, 32) };
     }
-    sset(local, K_MATCHES, JSON.stringify(next));
+    sset(local, keys.matches, JSON.stringify(next));
   };
-
-  const post = (msg) => {
-    try { channel?.postMessage({ ...msg, from: tabId }); } catch { /* channel closed */ }
-  };
-
-  // Session ownership is already valid while init is waiting. Shared candidates, including an
-  // explicit resume, remain tentative until saveToken receives the server's welcome.
-  const claimFor = (hash) => {
-    if (owned && tokenHash(owned) === hash) return { owned: true, at: welcomeAt, live: welcomed };
-    if ((current && tokenHash(current) === hash) || resolving?.hashes.has(hash)) return { owned: false, at: null, live: false };
-    return null;
-  };
-  const peerWins = (peer, from, ours) => {
-    if (!peer || !ours) return true; // an older client answering "mine" is conservatively treated as live
-    const a = Number.isFinite(peer.at) && peer.at >= 0 ? peer.at : Infinity;
-    const b = Number.isFinite(ours.at) && ours.at >= 0 ? ours.at : Infinity;
-    if (a !== b) return a < b;
-    if (!!peer.owned !== !!ours.owned) return !!peer.owned;
-    if (!!peer.live !== !!ours.live) return !!peer.live;
-    return from < tabId;
-  };
-  const yieldCandidate = (hash) => {
-    resolving?.taken.add(hash);
-    // The original page can reappear after resume's query but before its hello. Keep our old
-    // session in storage and give back the tentative selection immediately in that interval.
-    if (current && tokenHash(current) === hash) {
-      if (current === owned) {
-        owned = null; welcomeAt = null; welcomed = false;
-        sdel(session, K_WELCOME);
-      }
-      current = owned;
-      if (owned) sset(session, K_TOKEN, owned);
-      else sdel(session, K_TOKEN);
-      if (initialized) deps.onYield?.();
-    }
-  };
-
-  function onChannelMessage(ev) {
-    const m = ev && ev.data;
-    if (!m || typeof m !== 'object' || m.from === tabId || typeof m.from !== 'string') return;
-    if (m.type === 'who' && Array.isArray(m.hashes)) {
-      for (const h of m.hashes) {
-        if (typeof h !== 'string') continue;
-        const ours = claimFor(h);
-        if (!ours) continue;
-        const peer = m.claims?.[h] || { owned: false, at: null, live: false };
-        if (peerWins(peer, m.from, ours)) yieldCandidate(h);
-        else post({ type: 'mine', hash: h, claim: ours, to: m.from });
-      }
-    } else if (m.type === 'mine' && m.to === tabId && typeof m.hash === 'string') {
-      if (peerWins(m.claim, m.from, claimFor(m.hash))) yieldCandidate(m.hash);
-    }
-  }
-
-  async function resolveToken() {
-    channel = deps.channel !== undefined ? deps.channel : defaultChannel();
-    if (channel) {
-      if (typeof channel.addEventListener === 'function') channel.addEventListener('message', onChannelMessage);
-      else channel.onmessage = onChannelMessage;
-    }
-    // Without a channel we cannot tell whether a shared token is in use: never adopt one.
-    const candidates = owned ? [owned] : channel ? [...new Set(readRecent())] : [];
-    if (!channel || candidates.length === 0) return owned;
-    return queryCandidates(candidates);
-  }
-
-  async function queryCandidates(candidates) {
-    resolving = { hashes: new Set(candidates.map(tokenHash)), taken: new Set() };
-    post({ type: 'who', hashes: [...resolving.hashes],
-      claims: Object.fromEntries([...resolving.hashes].map((h) => [h, claimFor(h)])) });
-    await new Promise((r) => setTimer(r, queryMs));
-    const { taken } = resolving;
-    resolving = null;
-    return candidates.find((t) => !taken.has(tokenHash(t))) || null;
-  }
-
   return {
-    tabId,
-    /**
-     * Decide which reconnect token this tab uses (once per page load; later calls return the same
-     * promise). Call before the first `hello`. Never rejects.
-     * @returns {Promise<string|null>}
-     */
-    init() {
-      if (!initPromise) {
-        initPromise = resolveToken().catch(() => null).then((pick) => {
-          // A welcome may already have set a token while we were waiting: that one wins.
-          if (!welcomed) {
-            current = pick;
-            if (pick) sset(session, K_TOKEN, pick);
-            else {
-              owned = null; welcomeAt = null;
-              sdel(session, K_TOKEN); sdel(session, K_WELCOME);
-            }
-          }
-          initialized = true;
-          return current;
-        });
+    tabId: deps.tabId || '',
+    setAccount(account) {
+      const id = typeof account === 'string' ? account : account?.id;
+      if (id == null) {
+        accountId = null; keys = null; current = null; welcomeAt = null; initialized = false; recovery = null;
+        local = null; session = null; return;
       }
-      return initPromise;
+      if (typeof id !== 'string' || !ACCOUNT_ID.test(id)) throw new Error('Invalid account binding');
+      if (documentAccountId && documentAccountId !== id) throw new Error('Account changes require a page reload');
+      if (accountId === id) return;
+      documentAccountId = id; accountId = id;
+      local = deps.local !== undefined ? deps.local : safeStorage('localStorage');
+      session = deps.session !== undefined ? deps.session : safeStorage('sessionStorage');
+      const prefix = `sp.account.${id}.identity.`;
+      keys = Object.fromEntries(['name', 'token', 'welcome', 'recent', 'matches', 'entered', 'recovery'].map((k) => [k, prefix + k]));
+      recovery = readRecovery();
+      const own = recovery ? null : sget(session, keys.token);
+      current = recovery ? null : isToken(own) ? own : readRecent()[0] || null;
+      welcomeAt = null;
+      if (current) try {
+        const stamp = JSON.parse(sget(session, keys.welcome) || 'null');
+        if (stamp?.hash === tokenHash(current) && Number.isFinite(stamp.at) && stamp.at >= 0) welcomeAt = stamp.at;
+      } catch { /* stale stamp does not invalidate the saved token */ }
     },
-    /** Record only display metadata; the existing recent-token ring remains the authority. */
+    getAccountId: () => accountId,
+    async init() {
+      if (!accountId) throw new Error('A verified account is required');
+      initialized = true;
+      // Do not drop a token on peer conflict. The server denies a live second claim by default.
+      return current;
+    },
     rememberMatch,
     recoverable() {
+      if (recovery) return [];
       const matches = readMatches();
       return readRecent().filter((token) => token !== current).flatMap((token) => {
-        const hash = tokenHash(token), v = matches[hash];
-        return v && typeof v.name === 'string' && typeof v.code === 'string'
-          ? [{ id: hash, name: v.name.slice(0, 64), code: v.code.slice(0, 32) }] : [];
+        const hash = tokenHash(token), value = matches[hash];
+        return value && typeof value.name === 'string' && typeof value.code === 'string'
+          ? [{ id: hash, name: value.name.slice(0, 64), code: value.code.slice(0, 32) }] : [];
       });
     },
-    /** Explicit recovery only. Recheck live claims immediately before selecting a saved seat. */
+    /** Explicit saved-seat selection still uses noReplace and cannot silently take over another tab. */
     async resume(id) {
-      await this.init();
-      if (!channel || resumeBusy) return false;
-      const token = readRecent().find((t) => t !== current && tokenHash(t) === id);
-      if (!token || !this.recoverable().some((m) => m.id === id)) return false;
-      resumeBusy = true;
-      try {
-        const pick = await queryCandidates([token]);
-        if (!pick) return false;
-        current = pick;
-        return true;
-      } catch { return false; }
-      finally { resumeBusy = false; }
+      if (!accountId || !initialized || recovery) return false;
+      const token = readRecent().find((value) => value !== current && tokenHash(value) === id);
+      if (!token || !this.recoverable().some((item) => item.id === id)) return false;
+      current = token; welcomeAt = null; return true;
     },
-    /** @returns {string} remembered player name ('' if none) */
-    loadName: () => (sget(local, K_NAME) || '').slice(0, 64),
-    /** @param {string} name */
-    saveName: (name) => sset(local, K_NAME, String(name)),
-    /** Token for `hello` (null ⇒ new session). Before init() only this tab's own token is used. */
-    getToken() {
-      if (current) return current;
-      if (initialized) return null;
-      const own = sget(session, K_TOKEN);
-      return isToken(own) ? own : null;
-    },
-    /** A shared candidate must never replace a connected session, including a hello already in flight. */
-    getTokenClaim() {
-      return current === owned && owned
-        ? { noReplace: false, ...(welcomeAt != null ? { claimAt: welcomeAt } : {}) }
-        : { noReplace: true };
-    },
-    /** Only this page gives up the rejected claim; the shared recovery list belongs to all tabs. */
-    rejectToken() {
-      if (current) yieldCandidate(tokenHash(current));
-    },
-    /** @param {string} token from `welcome` */
+    loadName: () => keys ? (sget(local, keys.name) || '').slice(0, 64) : '',
+    saveName: (name) => { if (keys) sset(local, keys.name, String(name).slice(0, 64)); },
+    getToken: () => accountId ? current : null,
+    getTokenClaim: () => ({ noReplace: true, ...(welcomeAt != null ? { claimAt: welcomeAt } : {}) }),
+    // Compatibility: a refused account claim must NOT erase its token and mint a guest.
+    rejectToken() {},
     saveToken(token) {
-      if (!isToken(token)) return;
-      if (current !== token) rememberMatch(null);
-      if (owned !== token || welcomeAt == null) welcomeAt = now();
-      owned = token;
-      welcomed = true;
+      if (!keys || !isToken(token)) return;
+      if (current !== token) { rememberMatch(null); welcomeAt = null; }
+      if (welcomeAt == null) welcomeAt = now();
       current = token;
-      sset(session, K_TOKEN, token);
-      sset(session, K_WELCOME, JSON.stringify({ hash: tokenHash(token), at: welcomeAt }));
-      writeRecent([token, ...readRecent().filter((t) => t !== token)]);
+      sset(session, keys.token, token);
+      sset(session, keys.welcome, JSON.stringify({ hash: tokenHash(token), at: welcomeAt }));
+      writeRecent([token, ...readRecent().filter((value) => value !== token)]);
     },
-    /** Forget this tab's token (e.g. the server said the session is invalid). */
+    /** Only an explicit recovery action calls this; INVALID_RECONNECT alone never does. */
     clearToken() {
+      if (!keys) return;
       rememberMatch(null);
-      const t = current || sget(session, K_TOKEN);
-      current = null;
-      owned = null; welcomeAt = null; welcomed = false;
-      sdel(session, K_TOKEN);
-      sdel(session, K_WELCOME);
-      if (t) writeRecent(readRecent().filter((x) => x !== t));
+      const old = current;
+      current = null; welcomeAt = null;
+      sdel(session, keys.token); sdel(session, keys.welcome);
+      if (old) writeRecent(readRecent().filter((value) => value !== old));
     },
-    /** Whether this tab already passed the title screen (survives reloads, not new tabs). */
-    wasEntered: () => sget(session, K_ENTERED) === '1',
-    /** @param {boolean} on */
-    setEntered: (on) => (on ? sset(session, K_ENTERED, '1') : sdel(session, K_ENTERED)),
+    /** Persist explicit recovery BEFORE destroying the document; a fresh graph must not reuse any old token. */
+    beginRecovery({ previousPlayerId = null, notice = null } = {}) {
+      if (!keys || !session) return false;
+      const next = { v: 1,
+        previousPlayerId: typeof previousPlayerId === 'string' && previousPlayerId.length > 0 && previousPlayerId.length <= 64 ? previousPlayerId : null,
+        notice: ['match', 'room'].includes(notice) ? notice : null };
+      const encoded = JSON.stringify(next);
+      try {
+        session.setItem(keys.recovery, encoded);
+        if (session.getItem(keys.recovery) !== encoded) return false;
+      } catch { return false; }
+      recovery = next;
+      this.clearToken();
+      return true;
+    },
+    /** Called only after Net validates the account's welcome and saveToken accepts its new game token. */
+    finishRecovery(playerId) {
+      if (!keys || !recovery || !isToken(current) || typeof playerId !== 'string' || !playerId) return null;
+      const previous = recovery;
+      recovery = null;
+      // Either operation can fail in privacy/quota modes; never navigate or replay this notice in this document.
+      sset(session, keys.recovery, 'null'); sdel(session, keys.recovery);
+      return previous.previousPlayerId && previous.previousPlayerId !== playerId
+        ? RECOVERY_NOTICE[previous.notice] || null : null;
+    },
+    wasEntered: () => keys ? sget(session, keys.entered) === '1' : false,
+    setEntered: (on) => { if (keys) { if (on) sset(session, keys.entered, '1'); else sdel(session, keys.entered); } },
   };
 }
 
-/** Browser identity singleton (main.js awaits `identity.init()` before connecting). */
-export const identity = createIdentity({ onYield: () => net.reconnectNow(net.helloName || net.name) });
-
-/** Browser connection singleton (created lazily-safe: nothing touches the network until connect()). */
-export const net = new Net({ getToken: () => identity.getToken(), getTokenClaim: () => identity.getTokenClaim() });
+export const identity = createIdentity();
+export const net = new Net({ getToken: () => identity.getToken(), getTokenClaim: () => identity.getTokenClaim(),
+  getAccountId: () => identity.getAccountId() });

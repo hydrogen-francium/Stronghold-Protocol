@@ -2,6 +2,11 @@
 .git
 .github
 .claude
+.codex
+.context
+var
+deploy/secrets
+deploy/backups
 node_modules
 .cache
 .venv*
@@ -23,8 +28,9 @@ logs
 docs/img
 # the image needs only the research JSON tables (server/sim/nodeData.js fallback), not the notes
 docs/research/*.md
-# game art is mounted at runtime or downloaded with --build-arg FETCH_ASSETS=1, never sent from the host
+# 素材由初始化服务取得并只读挂载，不进入构建上下文。
 public/assets
+public/fonts
 # generated from node_modules inside the image
 public/vendor
 scripts/service.env.cmd
@@ -32,3 +38,22 @@ scripts/service.env.cmd
 Thumbs.db
 .env
 .env.*
+# 本地测试脚本、数据库、密钥与发行包不得进入任何镜像构建上下文。
+tools/deploy/test-*.py
+coverage
+test-results
+playwright-report
+.pytest_cache
+state
+backups
+*.sqlite*
+*.db
+*.db-wal
+*.db-shm
+*.pem
+*.key
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.tgz

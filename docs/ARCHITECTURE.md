@@ -9,12 +9,14 @@ the details in [SIM.md](SIM.md) (battle engine, hooks, SkillSpec), [META.md](MET
 effects), [DATA.md](DATA.md) (generated data), [ASSETS.md](ASSETS.md) (art and audio), [SKINS.md](SKINS.md) (operator
 skins: a cosmetic plugin's `chars[charId].skins`), [I18N.md](I18N.md)
 (languages) and [PLUGINS.md](PLUGINS.md) (plugins and the content hash; [PLUGIN-GUIDE.md](PLUGIN-GUIDE.md) the beginner's guide to
-making one, in Chinese). How to set up, test and send a change: [CONTRIBUTING.md](../CONTRIBUTING.md).
+making one, in Chinese). Fork account/authentication, Admission and local account scope are mapped in
+[AUTH.md](AUTH.md); they are deliberate fork additions, not upstream 0.3.1 release features.
+How to set up, test and send a change: [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 ## 1. What runs where
 
 ```
- browser (public/)                               one Node process (server/index.js, Node ≥ 22)
+ browser (public/)                               one authoritative Node app (server/index.js)
  ┌──────────────────────────────────────┐        ┌─────────────────────────────────────────────────────┐
  │ screens/, ui/   Preact + htm         │─ HTTP ▶│ server/http/  static files: / /data/ /shared/       │
  │ render/         PixiJS, pixi-spine,  │        │               /sim/ /media/, GET /healthz           │
@@ -25,11 +27,29 @@ making one, in Chinese). How to set up, test and send a change: [CONTRIBUTING.md
  └──────────────────────────────────────┘        └─────────────────────────────────────────────────────┘
 ```
 
-- **The server** is one Node process: plain `node:http` plus `ws`, no framework (`server/index.js` wires
-  `server/http/`). It serves the static client, the generated data and the sim's source files, and runs every room and
-  match in memory — rounds, shop, economy, bots, validation. Plugin authoring writes folders and locks to disk; the studio key persists too. Gameplay content sets use separate match children (§3).
-- **The browser** loads native ES modules with no bundler and no build step; the libraries are vendored into
-  `public/vendor/` by `tools/vendor.mjs` on `npm install`.
+- **The server** has one authoritative Node app process: plain `node:http` plus `ws`, no framework
+  (`server/index.js` wires `server/http/`), requiring Node `^22.16.0 || >=24.0.0`. Fail-closed `server/auth/config.js`
+  configuration creates private SQLite accounts/HTTP sessions before listening. The entry grant, HTTP identity and
+  account-owned game Session are three separate layers (AUTH.md §1). Rooms, matches, reconnects and Admission remain
+  in memory; restart ends every run even when accounts persist. Plugin authoring writes folders/locks to disk and the
+  Studio key persists too. Gameplay content sets use subordinate match children (§3), not more auth/Admission authorities.
+- **Active-seat Admission** is one central `server/auth/admission.js` instance, passed only to Lobby. The real match
+  roster reserves at most 16 distinct participating account IDs across rooms, plus a separate default AI budget of 16.
+  Waiting/spectating/socket/IP counts are not that ledger. Disconnect (including solo) retains a human reservation for
+  the normal ten-minute grace; real confirmed departure or captured match cleanup releases it idempotently. Frozen
+  original context and opaque lease tokens prevent stale callbacks from releasing a later reservation (AUTH.md §6).
+  Deploy a single app instance: SQLite/sticky sockets do not coordinate replica ledgers. Fork protocol version 2
+  adds co-op capacity 4/8/16 (default 4), host-only pre-match resizing and a frozen actual-roster runtime context.
+  Capacity is not a reservation or the gameplay participant count. Above-four personal inventories, private SP decks,
+  repeated-band sources, actual-alive boss scaling and lossless large-report takeover are implemented locally.
+  The browser retains 16 settlement rows and never assigns a missing identified self to a teammate. Auth-aware
+  single-instance Compose, isolated pinned-asset initialization and file-controlled draining are implemented;
+  real container cold start, 16-human browser acceptance and deployment performance remain unverified (COMPOSE.md).
+- **The browser** verifies `/auth/status` and binds the server account before importing preference-owning game
+  modules; changing accounts suspends work and reloads the document. Recovery metadata, avatar, loadout, skins,
+  statistics, plugin storage and local script consent are account-scoped in this browser, never automatically
+  inherited from guests or advertised as cloud sync (AUTH.md §7). It loads native ES modules with no bundler and no
+  build step; libraries are vendored into `public/vendor/` by `tools/vendor.mjs` on `npm install`.
 - **The battle simulation** (`server/sim/`) is pure ESM without any Node API, served read-only at `/sim/`. Both sides
   run it from the same JSON battle description (`server/sim/spec.js`, the BattleSpec): each player's browser simulates
   its own battle (`public/js/battle/runner.js`) and reports progress and the result; the server checks the result
@@ -64,6 +84,13 @@ Every frame is JSON text, `{ t, rid?, …fields }`.
 | | `b.start` (a BattleSpec), `b.pool` (the shared leader HP), `b.end`; `b.snap` / `b.ev` only in the server-run mode | `server/match/match/clientCombat.js` |
 | | `b.rehearsal`, `b.rehearsalCancel`: ask the host to test AI layouts or stop that task | `server/match/match/rehearsal.js` |
 
+- **Fork auth boundary.** Exact configured Origin and valid gate/account cookies are required for `/ws` upgrade;
+  immutable trusted identity enters Network out of band. Every frame/pong/heartbeat, queued execution and async reply
+  revalidates current store/credential state and original socket ownership. Explicit tokens must belong to the
+  authenticated account; ordinary hello uses `noReplace:true`, dedicated takeover alone may replace a live holder.
+  Invalid explicit recovery never becomes a guest; logout closes only the revoked `(accountId, tokenHash)` pair.
+  HTTP game/static routes are gated; only the small auth shell/API and anonymous minimal readiness precede identity.
+  AUTH.md §§4–5; DESIGN §8.1.
 - A request that carries `rid` is answered with `ok` or `error` echoing it. `server/net.js` rate-limits each socket,
   validates every message against `C2S` and refuses anything unknown; the handlers never trust the client.
 - Messages meant for people (`m.toast`, `m.ticker`) carry a message id and its parameters, so each client shows them in
@@ -86,18 +113,20 @@ so old imports keep working: `public/js/ui/gameLogic.js` (`public/js/ui/gameLogi
 
 | path | what |
 |---|---|
-| `server/index.js` | the process entry (`npm start`); `startServer()` wires `server/http/` |
+| `server/index.js` | the process entry (`npm start`); `startServer()` validates required auth configuration before listening, creates private account services and the sole Admission, then wires `server/http/`, Lobby and Network |
+| `server/auth/` | fork-only `config.js` (required Origin, independent secrets, private state, AI budget), `store.js` (schema-1 SQLite accounts/HTTP-session hashes and consistent backup), `passwords.js` (bounded async scrypt), `service.js` (entry/login cookies, exact Origin/CSRF, fresh validation/revocation), `admission.js` (synchronous participating-roster leases), `admin.js` (local disable/enable/reset-password/backup CLI), `child-env.js` (removes implicit private auth/state environment from children; not an OS sandbox); AUTH.md |
+| `server/http/auth.js` | exact small public `/auth/` allowlist and private Cookie-varying response wrapper; `routes.js` gates the game/static/Studio graph and exposes anonymous minimal `/healthz`; `websocket.js` authenticates `/ws` upgrade and passes trusted identity out of band |
 | `server/http/` | `csp.js` (site importmap hashes and independent simulation-Worker CSP), `config.js` (environment), `websocket.js` (sessions, `/ws`, permessage-deflate), `static.js` (the mounts, the `~<hash>` asset routes), `media.js`, `files.js` (MIME, brotli / gzip, ETag, ranges), `buildTag.js`, `routes.js` (`/healthz`), `traffic.js` (bytes sent by category and on the WebSocket, `/healthz?traffic=1`), `assetIndex.js` (the content hashes of `public/assets/` and `public/fonts/`, cached in `.cache/asset-hashes.json`), `assetViews.js` (the served `/data/assets.json` and `/data/local-assets.json`: every art URL with its hash segment; ASSETS.md), `common.js`, `boot.js` (a pending update package first, banner, shutdown) |
-| `server/net.js` | sessions and reconnect tokens, rate limits, message validation |
-| `server/lobby.js` | rooms, seats, AI seats, spectators; starts a `Match` |
+| `server/net.js` | account-owned game Sessions/reconnect tokens, explicit takeover, fresh authorization and original-connection guards, precise socket revocation, rate limits, message validation |
+| `server/lobby.js` | rooms, seats, AI seats, spectators; guarded per-room work queues; real-roster Admission reservation and captured stale-safe rollback/release around Match start, confirmed departure and cleanup |
 | `server/data.js` | loads `data/*.json` once (frozen) |
 | `server/plugins/` | the plugin system (PLUGINS.md, DESIGN §32): `registry.js` finds the language packs of `public/i18n/`, the pack folders of `packs/` and the plugins of `plugins/`, validates them (a cosmetic plugin's asset overlay too, its files hashed), answers `/packs/index.json`, `/plugins/index.json` and which files may be served, re-reads the folders when they change; `identity.js` computes the vanilla content hash `cs` from the served sim, shared code and data at start (`/cs/<cs16>/index.json`, `/healthz`, `welcome`, `room.state`); `visualSet.js` the visual sets of cosmetic plugins — a room's or a player's, named by `vs` — served at `/vs/<vs16>/overlay.json` (the composition and each plugin's writes: the browser composes the art itself, `public/js/assets.js`), their files at `/p/<id>/<hash8>/<path>`; `contentSet.js` builds a content set of data plugins (C1, DESIGN §32.5); `roomSets.js` turns a room's plugin list into its visual set and its content set, `contentSets.js` keeps the content sets rooms hold (by `cs`, the concurrent limit, `/cs/<cs16>/…`), `policy.js` reads the server owner's `plugins/config.json` (P1c, DESIGN §32.6) |
 | `server/plugins/` (scripts and installs) | `contentData.js` reads declared JSON; `trusted.js` checks mode, lock pins and listening addresses; `scriptPreflight.js` / `scriptProbe.js` probe setup in disposable children; `scriptTestSetup.js` preloads author tests; `trustedRuntime.js` / `trustedEntry.js` / `trustedApi.js` host native server extensions; `install.js` checks and installs local or hash-pinned HTTPS zips; `forgeImport.js` converts Forge packs without executing their scripts, and `forgeKits.js` carries their `kits/` into one sandboxed script plugin |
 | `server/plugins/` (packing) | `pack.js` checks a plugin folder and writes its `plugin.lock.json` (Spine clip data parsed from the skeleton), `zip.js` its deterministic zip — for `tools/plugin.mjs` and the studio |
-| `server/studio/` | the plugin studio 插件工作台 (PLUGINS.md §15, DESIGN §32.9): `index.js` serves `/studio/` and its API to this machine and the local network only (`gate.js`; every change carries the studio's key, `key.js`; `paths.js` its URLs for the static server), `files.js` keeps every read and write inside `plugins/<id>/` (no link followed), `templates/` (one module per template), `targets.js` (targets by official name), `edit.js` (fields, slots, one-click fixes), `preview.js` (the temporary composition), `watch.js` (hot reload: fs.watch → rescan → rooms apply again) |
+| `server/studio/` | the plugin studio 插件工作台 (PLUGINS.md §15, DESIGN §32.9): **production fork default-off**; explicit `SP_STUDIO=lan`, `local` or `loopback` enables the original peer/forwarded-address and Host gates (`gate.js`), not public access; writes still carry the owner key (`key.js`, `X-SP-Studio`), separate from account login. `index.js` serves the enabled API; `paths.js` its static URLs; `files.js` confines reads/writes to `plugins/<id>/` (no link followed), `templates/`, `targets.js`, `edit.js`, `preview.js`, `watch.js` implement authoring and hot reload |
 | `server/studio/` (gameplay authoring) | `gameData.js` reads official data and bundled template files; `authoring.js` validates/revises wizard drafts; `dslExamples.js` supplies examples; `trialOptions.js` lists scenarios; `trialScenario.js` builds BattleSpecs; `trial.js` owns jobs; `trialChild.js` builds content sets; `trialRunner.js` simulates in a disposable child; `trialDraft.js` confines draft writes and cleanup |
 | `server/studio/console.js`, `shared/studio/scenario.js` | standalone test console: keyed validation and match-equivalent BattleSpec building; versioned bounded scenario JSON shared with the browser; no rooms or server battle jobs |
-| `server/match/host/` | where a room with gameplay plugins plays (P1c, DESIGN §32.6): `index.js` one child process — or worker thread, `SP_MATCH_HOST=worker` — per content set, the watchdog and the limits; `childHost.js` adds permission-limited JSON-IPC children for sandbox scripts; `entry.js` inside it checks the set's bytes against `cs`, installs the data and only then imports `Match.js`; `ipc.js` validates and bounds child messages in the parent; `proxy.js` is the lobby's `room.match` for such a match (Promise answers, the room's messages in order) |
+| `server/match/host/` | where a room with gameplay plugins plays (P1c, DESIGN §32.6): `index.js` one child process — or worker thread, `SP_MATCH_HOST=worker` — per content set, watchdog and limits; `childHost.js` permission-limited JSON-IPC sandbox children; `entry.js` checks content bytes before importing Match and rejects asynchronous answers to called Match-interface methods; `ipc.js` bounds child messages; `proxy.js` is Lobby's hosted Match with ordered Promise replies, including ID-bearing acknowledged `onLeave` for permanent departure (not a disconnect notification); no auth service or Admission lease crosses this boundary |
 | `server/packs.js` | the content-pack API of 0.2.0 (PACKS.md), a compatibility export of `server/plugins/registry.js` |
 | `server/update.js` | the update package on the player's machine (DEPLOY.md §1.5): before the server starts, an extracted `UPDATE.json` is finished — the install verified against `MANIFEST.json`, the files the new version dropped deleted, or the start refused when the install is another version; doctor's `MANIFEST.json` check |
 | `server/match/Match.js` | one match: the phase machine, timers, the round loop, co-op, the views; its methods are in `server/match/match/` (`phases.js`, `prep.js`, `combat.js`, `clientCombat.js`, `rehearsal.js`, `reports.js`, `unitePhase.js`, `bossRounds.js`, `settle.js`, `views.js`, `intents.js` …) |
@@ -119,15 +148,16 @@ so old imports keep working: `public/js/ui/gameLogic.js` (`public/js/ui/gameLogi
 
 | path | what |
 |---|---|
-| `public/index.html`, `public/js/main.js` | the page and its entry: boot, the router (title → lobby → room → game) |
-| `public/js/net.js`, `public/js/store.js`, `public/js/data.js` | the socket client, the observable store, the data loader (`/data/*.json`, with the English overlay) |
+| `public/auth/` | fork's small pre-authentication page/module/style/four-language graph; no early game-module import |
+| `public/index.html`, `public/js/main.js`, `public/js/ui/accounts.js` | game page and verified-account-first boot, scope binding, suspend/logout/reload lifecycle, then router (title → lobby → room → game) |
+| `public/js/net.js`, `public/js/store.js`, `public/js/data.js` | account-bound socket client and recovery namespace, observable store and fail-closed account preference keys, game data loader (`/data/*.json`, with the English overlay) |
 | `public/js/content.js` | the room's cosmetic plugins and the player's own (PLUGINS.md §9): fetched, checked against `room.state.content.vs` and laid over the art manifest (`public/js/cosmetics.js` cosmetic layers — small; `shared/plugins/visual.js` loads with the first set —, data.js's view of `assets`); the plugin catalogue; the room's 插件 tag is `public/js/ui/pluginTag.js`, its panel `public/js/ui/pluginPanel.js` (loaded when it opens) |
 | `public/js/battle/` | `runner.js` (the local battle clock and reports), `simHost.js` (C4: vanilla InPageSimHost, every gameplay set WorkerSimHost), `simWorker.js` / `simWorkerRuntime.js` (pure Worker engine, no JSON fetch), `simLoader.js` (shared data loader), `rehearsal.js` / `rehearsalWorker.js` (same-origin module Worker: test AI layouts when `SP_BOT_REHEARSAL=host`), `observe.js` (who may watch which field) |
 | `public/js/screens/` | `title.js`, `lobby.js`, `room.js`, `loadout.js` (干员调配), `cultivation.js` (its 潜能 / 练度 controls), `ownership.js` (干员持有), `diy.js` (自选编队), `briefing.js`, `bandDraft.js`, `game.js` with `public/js/screens/game/`, `result.js` |
 | `public/js/ui/` | the HUD components (`hud.js`, `shopBar.js`, `detailPanel.js`, `bondStrip.js`, `teamPanel.js` …); `public/js/ui/gameLogic/` the pure in-match logic, unit-tested in Node |
 | `public/js/render/` | the field view: `app.js` with `public/js/render/app/`, `units.js` and `spine.js` (models), `tiles.js`, `projection.js`, `interp.js`, `pick.js`, `drag.js`, `public/js/render/fx/` (effects; `kinds.js` maps the fx kinds), `public/js/render/vfx/` (the official battle effects from the local client: a Unity ParticleSystem interpreter, GLSL shader ports, the WebGL2 pass, the event wiring and the skills' plans and their runtime, `skills.js` / `skillfx.js`, the 驭械术士's floating units, `funnels.js` / `funnelfx.js`; DESIGN §9), `public/js/render/board3d/` (the official 3D board) |
 | `public/css/`, `public/i18n/<code>.json` | the styles; the UI strings of each language pack (English ships) |
-| `public/studio/` | the plugin studio's page (`/studio/`, local network only): `index.html`, `studio.css`; `public/studio/js/main.js` the shell, `api.js` keyed requests, `create.js` / `picker.js` creation, `slots.js` / `info.js` / `issues.js` editing and findings, `labels.js` display names |
+| `public/studio/` | the plugin studio's page (`/studio/`, fork default-off; enabled access still requires account identity and the original local-network/owner gates): `index.html`, `studio.css`; `public/studio/js/main.js` the shell, `api.js` keyed requests, `create.js` / `picker.js` creation, `slots.js` / `info.js` / `issues.js` editing and findings, `labels.js` display names |
 | `public/studio/js/` (gameplay and import) | `authoring.js` / `validateDraft.js` wizard saves and validation; `editors/` template forms (including `dslForm.js` and shared `controls.js`); `trial.js` trial controls; `preview/` the game's cards, field and sound plus `replay.js` / `layers.js`; `forge.js` and `catalog.js` import/install flows |
 | `public/studio/console.html`, `public/studio/js/console/` | test console page: `main.js` key/JSON/persistence, `editor.js` scenario controls, `view.js` real sim/field host, `runtime.js` fixed-tick driving and bounded inspector/effect logs |
 | `public/js/ui/pluginSettings.js`, `public/js/ui/numberInput.js`, `public/js/ui/uiPlugins.js`, `public/js/ui/pluginFrame.js` | room settings controls, decimal input, personal UI switches and the sandboxed frame host |
@@ -136,12 +166,13 @@ so old imports keep working: `public/js/ui/gameLogic.js` (`public/js/ui/gameLogi
 
 | path | what |
 |---|---|
+| `var/` (or `SP_STATE_DIR`) | private fork account SQLite state, `auth.sqlite` plus WAL/SHM; outside every served root, never generated game data or a match save (AUTH.md §3) |
 | `data/*.json` | generated by `tools/build-data.mjs` and committed — never edited by hand (DATA.md); `data/backups.json` holds the 补位 and 自选 data, `data/i18n/<code>.json` the game texts of a language pack (English), `data/assets.json` the art manifest |
 | `packs/` | content packs installed as folders, `packs/<id>/pack.json` + files (PACKS.md); empty in the repository but for its readme |
 | `plugins/` | a server's plugins, `plugins/<id>/plugin.json` + files (PLUGINS.md); git-ignored but for its readme, its guide for AI agents (`plugins/AGENTS.md`) and the templates (`plugins/_template/cosmetic/`, `plugins/_template/content/`, `plugins/_template/script/`, `plugins/_template/ui/`) |
 | `schemas/` | JSON Schemas of manifests, asset overlays, compact records, DSL, UI messages and community catalogues (PLUGINS.md §15), for editors and AI agents |
 | `tools/` | `build-data.mjs`, `build-i18n.mjs`, `i18n.mjs` (UI strings, language packs), `packs.mjs` (content packs), `plugin.mjs` (plugins: list, check, pack, new, test, errors, surface, import-forge, install, catalog), `setup.mjs` / `fetch-assets.mjs` / `tools/assets/` (art and audio), `tools/local-extract/` (art from a local game client), `vendor.mjs`, `golden.mjs`, `check-imports.mjs`, `package.mjs` / `package-update.mjs` (the release zips, the update package, the example asset pack), `doctor.mjs`; sweeps: `matchrun.mjs`, `simrun.mjs`, `botbench.mjs`, `balance.mjs` |
-| `test/` | `node:test` suites by area: `test/content/` (kits, enemies, bonds, items), `test/sim/` (the engine), `test/match/` (match engine, bots), `test/ui/`, `test/render/`, `test/golden/` (the stored digests), `test/plugins/` and `test/studio/` (the plugin system, the studio), `test/helpers/` (`battleHarness.js`; `designDocs.js`, the design document in § order for the doc tests), `test/e2e/` (browser and bot runs) |
+| `test/` | `node:test` suites by area: `test/auth/` (fork auth modules and integration tests; targeted evidence and open full-CI/browser gates in AUTH.md §8), `test/content/` (kits, enemies, bonds, items), `test/sim/` (the engine), `test/match/` (match engine, bots), `test/ui/`, `test/render/`, `test/golden/` (the stored digests), `test/plugins/` and `test/studio/` (the plugin system, the studio), `test/helpers/` (`battleHarness.js`; `designDocs.js`, the design document in § order for the doc tests), `test/e2e/` (browser and bot runs) |
 | `types/` | JSDoc typedefs of the type-checked slice (`types/README.md`) |
 | `docs/` | the documents; `docs/DESIGN.md` the index of the design document, `docs/design/` its current rules, `docs/history/` its per-release revisions; `docs/research/` the research on the official mode |
 
@@ -185,6 +216,13 @@ public/assets/ ─────────▶ public/js/render/, public/js/audio
 
 ## 5. Safety nets
 
+The following tools and upstream checks describe the repository's safety nets. This fork has separate targeted
+execution evidence for auth/HTTP/WS, Lobby/Match/worker, client static/i18n, CI/doctor and documentation, plus later
+repository-cwd lint, typecheck, authenticated loopback smoke and the 288-scenario golden comparison. These are not
+one passing integrated CI run or SOURCE browser/deployment evidence. Current results and remaining gates, including
+the strict import baseline and the failed full regression (34 failures, including nine Windows symlink failures),
+are recorded in [AUTH.md §8](AUTH.md#8-current-limits-and-verification-status). Later passing subsets do not erase that run.
+
 - **Golden results** (`tools/golden.mjs`, `test/golden/`, `test/golden.test.js`): a fixed corpus of seeded scenarios —
   every chess with every skill and module, every bond, every leader and 联防 field, whole bot matches, every 补位
   stand-in and every 自选 operator — reduced to digests. `npm test` checks a fast subset; `npm run golden` or
@@ -193,10 +231,11 @@ public/assets/ ─────────▶ public/js/render/, public/js/audio
   and why (`test/golden/README.md`).
 - **Import boundaries** (`tools/check-imports.mjs`, `npm run check:imports`): `server/sim/` is served to browsers, so it
   may not import the match, the lobby, the server entry, the net layer (`ws`, `node:http` …), `public/` or any Node
-  builtin; `server/match/` may not import `public/` or the net layer. The one listed exception is
-  `server/sim/nodeData.js`, the Node-only data loader the browser never loads, and `test/check-imports.test.js` pins
-  that list. The kit layout test (`test/content/kits_layout.test.js`) also refuses Node-only imports, clocks and
-  `Math.random` in kits.
+  builtin; `server/match/` may not import `public/` or the net layer. The three existing hits are the `node:fs`,
+  `node:path` and `node:url` imports in `server/sim/nodeData.js`, the Node-only data loader the browser never loads.
+  `test/check-imports.test.js` pins that baseline; it is not a checker exemption: default mode reports it with exit 0,
+  while `--strict` exits 1. The kit layout test (`test/content/kits_layout.test.js`) also refuses Node-only imports,
+  clocks and `Math.random` in kits.
 - **Lint and types.** `npm run lint` is a correctness-only ESLint (`eslint.config.js`: warnings are allowed, errors
   are not); `npm run typecheck` checks a JSDoc slice (`jsconfig.json`; `types/README.md` says how to widen it). CI
   runs both once, and the tests on Ubuntu and Windows with Node 22 and 24 (`.github/workflows/ci.yml`).

@@ -76,6 +76,7 @@ export class MatchSetupVote {
     }
   }
 
+  /** 先准备全部开局数据与普通库存，再一次替换；返回执行结果，不重建仍有占用和透支的装备池。 */
   completeSetupReroll() {
     let prepared;
     try {
@@ -83,18 +84,19 @@ export class MatchSetupVote {
       const setup = setupMatchWaves(this.gd, rng);
       const stage = setup.stageId ? this.gd.stage(setup.stageId) : null;
       const bans = drawDisabledBonds(this.gd, rng);
-      const pool = new SharedPool(this.gd, { banned: bans.banned });
-      if (!pool.entries.size) throw new Error('rerolled chess pool is empty');
+      // 所有个人库存先构建成功，再原子替换开局，避免失败时只更新部分玩家。
+      const pools = Array.from({ length: this.runtimeContext.personalPools ? this.order.length : 1 }, () => new SharedPool(this.gd, { banned: bans.banned }));
+      if (!pools[0].entries.size) throw new Error('rerolled chess pool is empty');
       const off = new Set([...bans.drawn, ...bans.staticOff]);
       const stocks = this.order.map((ps) => ps.buildDiyStock(off));
-      prepared = { setup, stage, bans, pool, stocks };
+      prepared = { setup, stage, bans, pools, stocks };
     } catch (e) {
       this.reportError('reroll setup', e);
       this.cancelSetupVote();
       return fail(ERR.INTERNAL);
     }
-    // All data-dependent work succeeds before any opening or player state changes.
-    const { setup, stage, bans, pool, stocks } = prepared;
+    // 仅在全部依赖数据准备成功后提交，失败时保留原开局与各玩家库存。
+    const { setup, stage, bans, pools, stocks } = prepared;
     this.stageId = setup.stageId;
     this.stage = stage;
     this.factions = setup.factions;
@@ -103,9 +105,10 @@ export class MatchSetupVote {
     this.disabledBonds = bans.drawn;
     this.staticInactiveBonds = bans.staticOff;
     this.bannedChess = bans.banned;
-    this.pool = pool;
+    this.pool = this.runtimeContext.personalPools ? null : pools[0];
     this._botPath = null;
     for (const [i, ps] of this.order.entries()) {
+      ps.chessPool = pools[this.runtimeContext.personalPools ? i : 0];
       ps.diyStock = stocks[i].stock;
       ps.diyBanned = stocks[i].banned;
       ps.invalidateDeployMap();

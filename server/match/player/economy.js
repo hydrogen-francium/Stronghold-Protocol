@@ -10,6 +10,7 @@ import { freeSlot } from '../board.js';
 import { computeBonds } from '../bondsMeta.js';
 import { OK, fail } from './common.js';
 
+/** 玩家经济与商店操作；所有抽取按玩家所属的库存作用域执行。 */
 export class PlayerEconomy {
   addFunds(n, { reason = '' } = {}) {
     if (!Number.isFinite(n) || n === 0) return 0;
@@ -66,12 +67,14 @@ export class PlayerEconomy {
     return Number.isFinite(p) ? Math.max(0, Math.round(p)) : slot.basePrice;
   }
 
+  /** 从本玩家普通池与已解锁自选池抽一个干员商店槽，不预留展示库存；无货返回空。 */
   _rollChessSlot() {
     // the slotted 自选 pieces join the draw once the 调度中心 reaches their slot's level (player/diy.js diyRollEntries)
-    const id = this.m.pool.roll(this.m.rngShop, { maxTier: this.shop.level, extra: this.diyRollEntries() });
+    const id = this.chessPool.roll(this.m.rngShop, { maxTier: this.shop.level, extra: this.diyRollEntries() });
     return id ? { kind: 'chess', id, basePrice: this.gd.chessPrice(id), frozen: false, sold: false } : null;
   }
 
+  /** 按商店等级与房间规则抽一个装备槽，只读取玩家装备库存；无货返回空。 */
   _rollItemSlot() {
     // startRound rolls the shop before recompute, so the cached this.bonds can be one round behind.
     // bondBias therefore calls computeBonds at the roll (no rng). The official rule passes null and
@@ -82,7 +85,7 @@ export class PlayerEconomy {
       bias = new Set();
       for (const [id, st] of Object.entries(bonds)) if (st && st.active) bias.add(id);
     }
-    const id = this.m.pool.rollItem(this.m.rngShop, this.shop.level, this.m.itemPool, bias);
+    const id = this.chessPool.rollItem(this.m.rngShop, this.shop.level, this.itemPool, bias);
     return id ? { kind: 'item', id, basePrice: this.gd.itemPrice(id), frozen: false, sold: false } : null;
   }
 

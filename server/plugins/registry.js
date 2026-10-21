@@ -108,7 +108,7 @@ const noop = () => {};
  * @typedef {import('../../shared/plugins/errors.js').PluginIssue} PluginIssue
  * @typedef {{ where: string, problems: string[], issues?: PluginIssue[] }} Skipped
  *   issues: the problems with their codes (shared/plugins/errors.js; the plugin folders')
- * @typedef {{ publicDir: string, dataDir: string, packsDir: string, pluginsDir?: string }} PluginDirs
+ * @typedef {{ publicDir: string, dataDir: string, assetDataDir?: string, packsDir: string, pluginsDir?: string }} PluginDirs
  *   pluginsDir: the plugin folders (none: plugins/ is not read — the pack view of 0.2.0's callers)
  * @typedef {Map<string, StatIdentity & { sha256: string }>} HashCache
  *   SHA-256 of files by absolute path, while they keep the stat identity they were hashed with
@@ -689,9 +689,10 @@ export function crossPluginFindings(found) {
   return { plugins, skipped, warnings };
 }
 
-export function scanPlugins({ publicDir, dataDir, packsDir, pluginsDir }, { app = APP_VERSION, api = PLUGIN_API, hashCache = new Map(), vanilla = null, artCache = new Map() } = {}) {
+/** 扫描语言与插件目录；素材权限引用独立素材清单，业务数据仍使用原数据根。 */
+export function scanPlugins({ publicDir, dataDir, assetDataDir = dataDir, packsDir, pluginsDir }, { app = APP_VERSION, api = PLUGIN_API, hashCache = new Map(), vanilla = null, artCache = new Map() } = {}) {
   let art = vanilla;
-  const getArt = () => (art ||= readVanillaAssets(dataDir, artCache));
+  const getArt = () => (art ||= readVanillaAssets(assetDataDir, artCache));
   /** @type {Plugin[]} */
   const found = [];
   /** @type {Skipped[]} */
@@ -870,7 +871,8 @@ export function pluginIndexOf(plugins, { app = APP_VERSION, vanilla = null } = {
  * for a plugin's files their whole stat identity (statIdentity: also the inode and ctime, so a file rewritten with its
  * old size and mtime put back is noticed by the folders' own check, not only when a page asks for it at /p/).
  */
-function signature({ publicDir, dataDir, packsDir, pluginsDir }) {
+/** 计算注册表目录签名，素材变更与业务语言文件分别跟踪；不修改磁盘。 */
+function signature({ publicDir, dataDir, assetDataDir = dataDir, packsDir, pluginsDir }) {
   const parts = [];
   /** @param {{ left: number, over?: boolean }} [budget] a plugin folder's: its walk reads at most WALK_LIMITS.entries */
   const add = (dir, depth, tag, namesOnly = false, identity = false, budget = undefined) => {
@@ -902,8 +904,8 @@ function signature({ publicDir, dataDir, packsDir, pluginsDir }) {
       parts.push(`x:${n}/`);
       add(abs, 5, `x:${n}/`, false, true, { left: WALK_LIMITS.entries });
     }
-    try { const st = fs.statSync(path.join(dataDir, 'assets.json')); parts.push(`a:${st.size}:${Math.floor(st.mtimeMs)}`); } catch { /* none */ }
-    try { const st = fs.statSync(path.join(dataDir, 'local-assets.json')); parts.push(`la:${JSON.stringify(statIdentity(st))}`); } catch { /* none */ }
+    try { const st = fs.statSync(path.join(assetDataDir, 'assets.json')); parts.push(`a:${st.size}:${Math.floor(st.mtimeMs)}`); } catch { /* none */ }
+    try { const st = fs.statSync(path.join(assetDataDir, 'local-assets.json')); parts.push(`la:${JSON.stringify(statIdentity(st))}`); } catch { /* none */ }
   }
   return parts.join('\n');
 }
@@ -984,7 +986,7 @@ export function createPluginRegistry(dirs, { log = { info: noop, warn: noop }, a
     /** The entry of an id (any class, any status), or null. @param {string} id @returns {Plugin | null} */
     plugin: (id) => refresh().byId.get(id) || null,
     /** The installation's art manifest (VanillaAssets): the one the last scan read, else read now (kept by size + mtime). */
-    vanillaAssets: () => refresh().vanilla || readVanillaAssets(dirs.dataDir, artCache),
+    vanillaAssets: () => refresh().vanilla || readVanillaAssets(dirs.assetDataDir ?? dirs.dataDir, artCache),
     /** The loaded language entries, optionally of one manifest 1 type. @param {string} [type] @returns {Plugin[]} */
     list: (type) => refresh().packs.filter((p) => !type || p.type === type),
     /** Every plugin and pack found, optionally of one class. @param {string} [cls] @returns {Plugin[]} */

@@ -10,6 +10,7 @@ import { pieceDir, parseDir, mergeTile } from '../board.js';
 import { MAX_OFFER_SLOTS } from './common.js';
 import { onMerge } from '../botEmotes.js';
 
+/** 玩家干员、装备和奖励的取得与合成；扣账和透支始终归属取得者。 */
 export class PlayerAcquire {
   /** Normal copies of a base chess currently owned (board/hand/temp). */
   countCopies(baseId) {
@@ -175,20 +176,20 @@ export class PlayerAcquire {
     return np;
   }
 
-  /** Normal item → golden version in place (整备). A golden occupies two shared copies and this piece
-   * already occupies one, so the upgrade waits when no second copy is free. The caller keeps its charge. */
+  /** 将给定普通装备原地升为高级版本并重算状态；仅当玩家库存还能提供第二份时返回成功。 */
   upgradeItem(piece) {
     const rec = this.gd.item(piece.id);
     if (!rec || rec.isGolden) return false;
     const gid = rec.upgradeChessId || rec.goldenId;
     if (!gid || !this.gd.item(gid)) return false;
-    if (this.m.itemPool.left(piece.id) < 1) return false;
+    if (this.itemPool.left(piece.id) < 1) return false;
     piece.id = gid;
     this.recompute();
     return true;
   }
 
   /**
+   * 将指定来源的干员奖励入队；未指定编号时按玩家所属普通池与自选池抽取，返回奖励对象或空。
    * Queue a reward offer: `count` DIFFERENT chess of tier min(level + offset, maxTier) at price 0 (pick 1). Each is a
    * copy-weighted roll from the shared pool excluding the ones already drawn; a tier left without another chess tops
    * up from the tier below (user playtest #6 item 19: the official promotion reward never offers one operator twice —
@@ -209,7 +210,7 @@ export class PlayerAcquire {
       const fresh = (id) => !list.includes(id);
       for (let i = 0; i < ro.count; i++) { // loop-cap: rewardOffer().count ≤ MAX_OFFER_SLOTS
         let id = null;
-        for (let tt = t; tt >= 1 && !id; tt--) id = this.m.pool.roll(this.m.rngShop, { tier: tt, filter: fresh, extra: this.diyStockEntries() });
+        for (let tt = t; tt >= 1 && !id; tt--) id = this.chessPool.roll(this.m.rngShop, { tier: tt, filter: fresh, extra: this.diyStockEntries() });
         if (id) list.push(id);
       }
     }
@@ -224,8 +225,9 @@ export class PlayerAcquire {
    * Queue a free pick-one offer of items (凯瑟琳 定向投放, 娜仁图亚 见者有份); shown as shop.rewardOffer with slots of kind
    * 'item' under its `label` (the effect's name; player report #6 after 0.1.0).
    */
+  /** 将给定装备编号按玩家当前库存筛选后入队，不预留副本；返回奖励对象，无可选项返回空。 */
   pushItemOffer(ids, { source = 'effect', tier = null, label = null } = {}) {
-    const list = [...new Set(Array.isArray(ids) ? ids : [])].filter((id) => this.gd.item(id) && this.m.itemPool.canGain(id)).slice(0, MAX_OFFER_SLOTS);
+    const list = [...new Set(Array.isArray(ids) ? ids : [])].filter((id) => this.gd.item(id) && this.itemPool.canGain(id)).slice(0, MAX_OFFER_SLOTS);
     if (!list.length) return null;
     const offer = { tier: Number.isInteger(tier) ? tier : null, source, label: typeof label === 'string' && label ? label : null, slots: list.map((id) => ({ kind: 'item', id, price: 0, sold: false })) };
     this.offers.push(offer);
@@ -259,6 +261,7 @@ export class PlayerAcquire {
   }
 
   /**
+   * 为玩家取得指定装备并触发合成和效果，返回实际保留的物品或空；展示透支仅记入玩家所属装备账本。
    * Acquire an item (buy, supply card, grant). Merges with an identical normal copy (hand/temp/equipped) into the
    * golden item (to the hand). Returns the owned piece or null.
    * `deferMerge` (effectsMeta, while onPrepEnd is on the stack): stow it — hand, else temp — and do not merge in this
@@ -275,7 +278,7 @@ export class PlayerAcquire {
     // Only the fixed operator-gift families can overdraw. Several unrelated strategy grants also pass
     // requirePool:false; they must retain their stock limit (for example commercial packaging).
     const unlimitedGift = !requirePool && this.gd.isUnlimitedGiftItem(itemId);
-    const pool = this.m.itemPool;
+    const pool = this.itemPool;
     const leftBefore = pool.left(itemId);
     const need = pool.need(itemId);
     if (!unlimitedGift && !displayed && !pool.canGain(itemId)) {

@@ -36,10 +36,11 @@ export class InPageSimHost {
   }
   progress() { return this.sim.spec.battleProgress(this.battle); }
   uniteLeft() { return this.sim.spec.uniteLeft(this.battle); }
-  compactResult(options) {
-    const s = this.sim.spec;
-    const r = s.compactResult(this.battle.result());
-    return typeof s.fitResult === 'function' ? s.fitResult(r, options) : r;
+  /** 返回可展示的有界报告；账本超限时为空，发送方须读取完整报告决策。 */
+  compactResult(options) { return this.resultReport(options).result; }
+  /** 根据原始账本与实际内容集构造发送决策，不修改模拟状态。 */
+  resultReport(options) {
+    return this.sim.spec.prepareResultReport(this.battle.result(), { battleId: this.spec.battleId, ...options, cs: this.sim.cs });
   }
   unitStats(id) {
     const u = this.battle?.unitById?.(id);
@@ -121,7 +122,10 @@ export class WorkerSimHost {
   async step(n, opts) { return this.accept(await this.rpc('step', [n, opts])); }
   progress() { return this.packet.progress; }
   uniteLeft() { return this.packet.left; }
-  compactResult() { return this.packet.result; }
+  /** 返回工作线程已经审核预算的展示结果，不重新生成或截断账本。 */
+  compactResult() { return this.packet.report?.result; }
+  /** 返回工作线程的完整报告决策，供权威发送方选择报告或接管声明。 */
+  resultReport() { return this.packet.report; }
   unitStats(id) {
     if (!this.stopped && !this.statsPending.has(id)) {
       this.statsPending.add(id);

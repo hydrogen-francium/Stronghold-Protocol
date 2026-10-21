@@ -6,7 +6,7 @@
 import { PHASE } from '../../../shared/constants.js';
 import { boardOrder, pieceDir } from '../board.js';
 import { bondList, offBondCounts } from '../bondsMeta.js';
-import { bountyText, bountyCard } from '../choices.js';
+import { bountyText, bountyCard, cardView } from '../choices.js';
 
 export class PlayerViews {
   pieceView(p, rc = null) {
@@ -54,6 +54,7 @@ export class PlayerViews {
     return out;
   }
 
+  /** 构造仅发给所有者的状态；个人机变候选不进入公共快照，重连时可恢复当前修订标识。 */
   privateView() {
     const slots = this.shop.slots.map((s) => (s ? { kind: s.kind, id: s.id, price: this.priceOf(s), basePrice: s.basePrice, sold: !!s.sold, frozen: !!s.frozen } : null));
     const offer = this.offers[0] || null;
@@ -62,6 +63,7 @@ export class PlayerViews {
     for (const { r, c, piece } of boardOrder(this.board)) board.push(this.pieceView(piece, [r, c]));
     // a boss round's prep: the partner's board on its half of the boss field (Match.bossMateView, item 51)
     const bossMate = typeof this.m.bossMateView === 'function' ? this.m.bossMateView(this) : null;
+    const deck = this.m.phase === PHASE.SP_DRAFT && this.m.sp?.personal ? this.m.sp.decks.get(this.playerId) : null;
     return {
       t: 'm.private',
       playerId: this.playerId,
@@ -72,6 +74,8 @@ export class PlayerViews {
       bandId: this.bandId,
       ready: this.ready,
       canReady: this.alive && this.tempEmpty && !this.personalChoice && this.m.phase === PHASE.PREP,
+      ...(deck ? { sp: { id: deck.id, round: this.m.round, instance: this.m.sp.instance, family: deck.family, name: deck.name, desc: deck.desc, eventId: deck.eventId,
+        cards: deck.cards.map((c) => ({ ...cardView(c), soldOut: c.kind === 'item' && !this.itemPool.canGain(c.id) })) } } : {}),
       personalChoice: this.personalChoice ? {
         id: this.personalChoice.id,
         round: this.personalChoice.round,

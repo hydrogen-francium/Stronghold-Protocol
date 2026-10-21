@@ -41,7 +41,7 @@
 
 import {
   num, buffsOf, bandRecord, isOp, onField, isElite, tierOf, unitBonds, activeBondIds, playerOps, passiveBuff, fxOn,
-  matchBands, gainLayers, alliesAround, N4, baseChessId, isGroundOp, directMods,
+  matchBands, contentInfo, gainLayers, alliesAround, N4, baseChessId, isGroundOp, directMods,
 } from '../support/index.js';
 import { weaknessRetype, addShieldLayer, PRIO_RESPAWN, reviveNow } from '../items/battle.js';
 import { spawnMapChar } from '../tokens.js';
@@ -233,22 +233,33 @@ export function amedicCharsFor(elites, variants = amedicVariants()) {
   return [];
 }
 
+/** 为每个目标玩家安装医疗；超过四人局按战斗输入中的持有人来源逐份生成，不按策略名去重。 */
 function installMapChars(battle) {
   const variants = amedicVariants();
   if (!variants.length) return;
-  const holders = battle.players.filter((ps) => matchBands(battle, ps.playerId).includes(AMEDIC_BAND));
+  const holders = battle.players.filter((ps) => contentInfo(battle, ps.playerId).teamMedicSources?.length
+    || matchBands(battle, ps.playerId).includes(AMEDIC_BAND));
   if (!holders.length) return;
+  /** 在实际部署完成后按每名目标的精锐数生成独立医疗，修改战斗单位列表。 */
   battle.on('battleStart', () => {
     const chars = [];
     for (const ps of holders) {
       const elites = deployedOps(battle, ps.playerId).filter(isElite).length;
-      for (const id of amedicCharsFor(elites, bandRecord(ps.bandId)?.effectRef === AMEDIC_BAND ? amedicVariants(ps.bandId) : variants)) chars.push({ playerId: ps.playerId, id });
+      const sources = contentInfo(battle, ps.playerId).teamMedicSources;
+      if (sources) {
+        // 每个来源只展开一次；每份医疗独立读取目标精锐阈值及来源策略的原参数。
+        for (const source of sources) {
+          for (const id of amedicCharsFor(elites, amedicVariants(source.bandId))) chars.push({ playerId: ps.playerId, id, source });
+        }
+      } else {
+        for (const id of amedicCharsFor(elites, bandRecord(ps.bandId)?.effectRef === AMEDIC_BAND ? amedicVariants(ps.bandId) : variants)) chars.push({ playerId: ps.playerId, id });
+      }
     }
-    for (const [i, { playerId, id }] of chars.entries()) {
+    for (const [i, { playerId, id, source }] of chars.entries()) {
       // The reserve medic occupies this stage slot in preparation; Touch replaces it at battle start. [ASSUMED]
       // Replacement preserves the slot's priority before ordinary deployments. Shared-field ordering between
       // prepared characters follows player order, as for other initial placements (lifecycle.js).
-      const u = spawnMapChar(battle, playerId, id, { preBattleAggroSeq: i - chars.length });
+      const u = spawnMapChar(battle, playerId, id, { preBattleAggroSeq: i - chars.length, mapCharSource: source });
       if (u) fxOn(battle, 'summon', u, keyOf(AMEDIC_BAND), AMEDIC_BAND);
     }
   });

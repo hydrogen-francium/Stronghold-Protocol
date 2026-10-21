@@ -20,7 +20,7 @@ export function createSimWorker({ loadSim, prepareScripts = browserScripts } = {
       meta: b.fieldMeta(), players: Object.fromEntries(pids.map(id => [id, { bonds: b.getPlayer(id)?.bonds }])),
       ops: Object.fromEntries(pids.map(id => [id, host.ownerOps(id)])), meter: { lp: host.meter.lp },
       progress: host.progress(), left: host.spec.kind === 'unite' ? host.uniteLeft() : null,
-      result: b.finished ? host.compactResult({ bossLike: ['boss', 'hidden'].includes(host.spec.kind), battleId: host.spec.battleId }) : null,
+      report: b.finished ? host.resultReport() : null,
     };
   };
   return async (method, args = []) => {

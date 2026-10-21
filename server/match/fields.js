@@ -842,7 +842,8 @@ export function validateClientResult(spec, raw, { gd = null } = {}) {
         // set only after a 联防 `uniteRuntime` leak spends the offspring budget below — never copied off another field
         let keepRuntime = false;
         if (spec.kind === 'unite') {
-          if (!sourcePlayerId || !B.sources.has(sourcePlayerId)) sourcePlayerId = src && typeof src.sourcePlayerId === 'string' ? src.sourcePlayerId : null;
+          // 联防必须提交真实来源，不能把未知来源静默改记到同类敌人的第一名来源上。
+          if (!sourcePlayerId || !B.sources.has(sourcePlayerId)) return bad('leak source');
           // whose LP a surviving enemy costs. An unflagged leak spends the wave that leaker sent in, then the offspring
           // those enemies' data allow (official enemy_database talentBlackboard: DeadSpawn.enemy_key / .cnt).
           // `uniteRuntime` exempts a runtime child from LP (player report 2026-10-16, PR #675). It must spend only

@@ -7,6 +7,22 @@ import { t } from '../../../../shared/i18n.js';
 // ---- result -----------------------------------------------------------------------------------------------------------
 
 /**
+ * 计算结算雷达的席位卡位置；原四席保持原图布局，高位稀疏席位按实际成员紧凑排列。
+ * @param {any[]} players 已规范化的参与者，席位编号保持原值。
+ * @returns {Array<{xy: number[], p: any, number: number}>} 展示位置、成员和真实席位号。
+ */
+export function settlementIntroSeats(players) {
+  if (!players.length) return [];
+  if (players.length <= 4 && players.every((p) => p.seat < 4)) {
+    return [[640, 355], [1145, 355], [640, 640], [1145, 640]].map((xy, seat) =>
+      ({ xy, p: players.find((p) => p.seat === seat) || null, number: seat + 1 }));
+  }
+  return [...players].sort((a, b) => a.seat - b.seat).map((p, i) => ({
+    xy: [i % 2 ? 1290 : 490, 110 + Math.floor(i / 2) * 96], p, number: p.seat + 1,
+  }));
+}
+
+/**
  * Normalise an m.result payload (free-form; see screens/result.js header for the expected shape).
  * @param {any} res
  * @param {any} pub last m.public (fallbacks)

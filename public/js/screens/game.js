@@ -297,7 +297,7 @@ function MatchScreen() {
   const editable = !offerBlocksPrep(pub?.offers) && phase === PHASE.PREP && !!priv && alive && !priv.ready && !watchingOther && !hasPersonalChoice;
   const showShop = !!priv && alive && (phase === PHASE.PREP || phase === PHASE.SP_DRAFT || phase === PHASE.ROUND_START) && !watchingOther;
   const layersDisabled = phase === PHASE.UNITE || isBossPhase(phase);
-  const sp = phase === PHASE.SP_DRAFT ? normalizeSp(pub?.sp, players) : null;
+  const sp = phase === PHASE.SP_DRAFT ? normalizeSp(pub?.sp, players, priv, myId) : null;
   const total = phaseTotalSeconds(pub, gd.config, myId);
   // solo pause: offered in the own battle; while m.public.paused every HUD clock stops at the pause moment
   const paused = isPaused(pub);
@@ -1774,8 +1774,14 @@ function MatchScreen() {
     </div>
 
     ${hasOffers && !sp && !personalChoice ? html`<${OfferOverlay} pub=${pub} myId=${myId} readOnly=${spectator || !alive} onAction=${actions.offer} />` : null}
-    ${sp ? html`<${ChoiceOverlay} pub=${pub} sp=${sp} myId=${myId} solo=${solo} busyIdx=${spBusy} total=${total}
-      onPick=${async (i) => { setSpBusy(i); await actions.choice(i); setSpBusy(null); }} />` : null}
+    ${sp ? html`<${ChoiceOverlay} key=${sp.id ?? 'shared'} pub=${pub} sp=${sp} myId=${myId} solo=${solo}
+      busyIdx=${spBusy?.choiceId === sp.id ? spBusy.idx : null} total=${total}
+      onPick=${async (i) => {
+        const choiceId = sp.id;
+        setSpBusy({ choiceId, idx: i });
+        await actions.choice(i, choiceId ?? undefined);
+        setSpBusy((b) => b?.choiceId === choiceId ? null : b);
+      }} />` : null}
     ${personalChoice ? html`<${ChoiceOverlay} key=${personalChoice.id} pub=${pub} sp=${personalChoice} myId=${myId} solo=${solo} personal=${true}
       busyIdx=${personalBusy?.choiceId === personalChoice.id ? personalBusy.idx : null} total=${total}
       onPick=${async (i) => {

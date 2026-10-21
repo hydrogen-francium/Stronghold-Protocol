@@ -17,13 +17,20 @@ function loadScript(src) {
   });
 }
 
+function configurePixi(PIXI) {
+  installPixiNoEval(PIXI);
+  // Pixi's optional worker probe fetches a data: image, forbidden by connect-src 'self'.
+  PIXI.Assets.setPreferences({ preferWorkers: false });
+  return PIXI;
+}
+
 /** Make sure PIXI and PIXI.spine exist (classic scripts; loaded once). */
 export function ensurePixi() {
-  if (globalThis.PIXI && globalThis.PIXI.spine) { installPixiNoEval(globalThis.PIXI); return Promise.resolve(globalThis.PIXI); }
+  if (globalThis.PIXI && globalThis.PIXI.spine) return Promise.resolve(configurePixi(globalThis.PIXI));
   if (!pixiPromise) {
     pixiPromise = (async () => {
       if (!globalThis.PIXI) await loadScript(VENDOR.pixi);
-      installPixiNoEval(globalThis.PIXI);
+      configurePixi(globalThis.PIXI);
       if (!globalThis.PIXI?.spine) await loadScript(VENDOR.spine);
       if (!globalThis.PIXI || !globalThis.PIXI.spine) throw new Error('PIXI / pixi-spine unavailable');
       return globalThis.PIXI;

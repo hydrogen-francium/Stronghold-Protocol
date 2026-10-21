@@ -11,8 +11,8 @@
 // Reloading a tab that already passed the title re-enters automatically (sessionStorage flag) and
 // resumes the server session with the saved token; stale room/match state is dropped if the
 // server does not re-push it within RESTORE_GRACE_MS after `welcome`. Boot waits for
-// `identity.init()` (which token this tab may use without stealing another live tab's session)
-// before the first connect; a page restored from the back/forward cache reloads.
+// server account, then `identity.init()`, before the first connection; a page restored from the
+// back/forward cache reloads instead of reusing another account's module caches.
 // A `welcome` with a NEW playerId (the server restarted / the session expired) while a room or match was on screen:
 // toast 「服务器会话已重置，上一局模拟已结束」 (store.js sessionResetNotice) and return to the lobby with nothing stale.
 //
@@ -32,48 +32,57 @@
 // plugins over the art manifest every screen reads. Gameplay plugins (§32.6): installContentSet (content.js) downloads and
 // checks a room's content set and makes it the data every screen and the battle runner read.
 
-// Polyfills first (older Safari / Firefox ESR): every module evaluated after this one sees them.
+// Only this audited, cache-free graph is evaluated before the verified preference binding:
+// compat; accounts -> components -> data/assetUrls; store -> shared constants/i18n;
+// vendor preact/hooks/htm and the pure shared i18n data/pack helpers. None initialise account prefs.
 import './ui/compat.js';
-import { render } from '../vendor/preact.module.js';
-import { useErrorBoundary } from '../vendor/hooks.module.js';
-import { html, UiHosts, Button, MicroLabel, closeAllDialogs } from './ui/components.js';
-import { ConnectionBanner } from './ui/connBanner.js';
-import { ToastHost, toast, toastError, describeError } from './ui/toasts.js';
-import { net, identity, NetError } from './net.js';
-import { store, useStore, emptyMatch, selectRoute, sessionResetNotice, isSpectating } from './store.js';
-import { data } from './data.js';
-import { GAME_FILES } from './ui/gameComponents.js';
-import { TitleScreen, sanitizeName } from './screens/title.js';
-import { LobbyScreen, rememberRoom, parseRoomParam, joinKnown } from './screens/lobby.js';
-import { RoomScreen, TrustedNotice } from './screens/room.js';
-import { GameScreen } from './screens/game.js';
-import { audio, installAudio } from './audio.js';
-import { settingsStore } from './ui/settings.js';
-import { GuideHost } from './ui/guide.js';
-import { installDeviceSupport } from './ui/device.js';
-import { registerImportedAssetWorker } from './assetCache.js';
-import { LoadoutHost } from './screens/loadout.js';
-import { StatsHost } from './screens/stats.js';
-import { installRehearsal } from './battle/rehearsal.js';
-import { recordResult, installStatsRecorder } from './ui/stats.js';
-import { installLoadoutSync, installOwnershipSync, installDiySync, installSkinsSync } from './ui/loadoutSync.js';
-import { startBuildGuard } from './ui/buildGuard.js';
-import { initLang, useLang, tickerText } from './ui/lang.js';
+import * as accounts from './ui/accounts.js';
+import { store, useStore, setAccountScope, emptyMatch, selectRoute, sessionResetNotice, isSpectating, roomCapacityOptions } from './store.js';
 import { t, N_, translateWire } from '../../shared/i18n.js';
-import { recordError, installTrafficMeter } from './diag.js';
-import { installContent, installContentSet } from './content.js';
-import { cosmetics } from './cosmetics.js';
+
+let net, identity, NetError;
+let render, useErrorBoundary, html, UiHosts, Modal, Button, MicroLabel, closeAllDialogs;
+let ConnectionBanner, ToastHost, toast, toastError, describeError, data, GAME_FILES;
+let TitleScreen, sanitizeName, LobbyScreen, rememberRoom, parseRoomParam, joinKnown, RoomScreen, TrustedNotice, GameScreen;
+let audio, installAudio, settingsStore, GuideHost, installDeviceSupport, registerImportedAssetWorker, LoadoutHost, StatsHost;
+let installRehearsal, recordResult, installStatsRecorder, installLoadoutSync, installOwnershipSync, installDiySync, installSkinsSync;
+let startBuildGuard, initLang, useLang, tickerText, recordError, installTrafficMeter, installContent, installContentSet, cosmetics, stopPluginFrames;
+let SCREENS;
+
+/** loadout/skins/content and every module-time preference consumer are evaluated ONLY after setAccountScope. */
+async function loadGameGraph() {
+  const modules = await Promise.all([
+    import('../vendor/preact.module.js'), import('../vendor/hooks.module.js'), import('./ui/components.js'),
+    import('./ui/connBanner.js'), import('./ui/toasts.js'), import('./data.js'), import('./ui/gameComponents.js'),
+    import('./screens/title.js'), import('./screens/lobby.js'), import('./screens/room.js'), import('./screens/game.js'),
+    import('./audio.js'), import('./ui/settings.js'), import('./ui/guide.js'), import('./ui/device.js'), import('./assetCache.js'),
+    import('./screens/loadout.js'), import('./screens/stats.js'), import('./battle/rehearsal.js'), import('./ui/stats.js'),
+    import('./ui/loadoutSync.js'), import('./ui/buildGuard.js'), import('./ui/lang.js'), import('./diag.js'),
+    import('./content.js'), import('./cosmetics.js'), import('./ui/pluginFrame.js').then((module) => {
+      // Logout can finish while these imports are still fetching/evaluating. Terminate a late frame module too.
+      stopPluginFrames = module.stopPluginFrames;
+      if (accountPageStopped) stopPluginFrames();
+      return module;
+    }),
+  ]);
+  [{ render }, { useErrorBoundary }, { html, UiHosts, Modal, Button, MicroLabel, closeAllDialogs },
+    { ConnectionBanner }, { ToastHost, toast, toastError, describeError }, { data }, { GAME_FILES },
+    { TitleScreen, sanitizeName }, { LobbyScreen, rememberRoom, parseRoomParam, joinKnown }, { RoomScreen, TrustedNotice }, { GameScreen },
+    { audio, installAudio }, { settingsStore }, { GuideHost }, { installDeviceSupport }, { registerImportedAssetWorker },
+    { LoadoutHost }, { StatsHost }, { installRehearsal }, { recordResult, installStatsRecorder },
+    { installLoadoutSync, installOwnershipSync, installDiySync, installSkinsSync }, { startBuildGuard },
+    { initLang, useLang, tickerText }, { recordError, installTrafficMeter }, { installContent, installContentSet }, { cosmetics }, { stopPluginFrames }] = modules;
+  SCREENS = { title: TitleScreen, lobby: LobbyScreen, room: RoomScreen, game: GameScreen };
+}
 
 const RESTORE_GRACE_MS = 1500;
 const JOIN_DELAY_MS = 350;
 const TICKER_KEEP = 20;
 const EMOTE_KEEP = 20;
 
-const SCREENS = { title: TitleScreen, lobby: LobbyScreen, room: RoomScreen, game: GameScreen };
-
 /** Copy of a server message without transport fields. */
 function payload(msg) {
-  const { t, rid, ...rest } = msg; // eslint-disable-line no-unused-vars
+  const { t, rid, ...rest } = msg;
   return rest;
 }
 
@@ -97,6 +106,9 @@ let joinTimer = null;
 let joinInFlight = false;
 /** The rehearsal installer (battle/rehearsal.js): its tasks follow the match on screen (see wireNet's store hook). */
 let rehearsal = null;
+let buildGuard = null;
+let accountPageStopped = false;
+let accountRecoveryStarted = false;
 
 function clearPendingJoin() {
   store.patch('ui', { pendingJoin: null });
@@ -119,10 +131,10 @@ function schedulePendingJoin() {
     try {
       await joinKnown('room.join', code);
     } catch (err) {
-      toastError(err);
+      if (!accountPageStopped) toastError(err);
     } finally {
       joinInFlight = false;
-      clearPendingJoin();
+      if (!accountPageStopped) clearPendingJoin();
     }
   }, JOIN_DELAY_MS);
 }
@@ -158,6 +170,7 @@ const pluginCount = (content) => (content && Number.isInteger(content.plugins) &
 
 function onWelcome(msg) {
   identity.saveToken(msg.token);
+  let resetNotice = identity.finishRecovery(msg.playerId);
   identity.rememberMatch(null);
   const prev = store.get();
   const prevId = prev.me.playerId;
@@ -171,15 +184,15 @@ function onWelcome(msg) {
     installedPlugins: pluginCount(msg.content),
     installedNotices: msg.content?.notices === true,
     testMode: msg.testMode === true,
+    roomCapacities: roomCapacityOptions(msg.roomCapacity),
   });
   welcomeAt = Date.now();
 
   if (prevId != null && prevId !== msg.playerId) {
     // A brand-new server session (the server restarted — crashed / killed, so no room.closed arrived — or this session
     // expired on it): whatever we showed before is gone — back to the lobby cleanly and say why.
-    const notice = sessionResetNotice(prev, msg.playerId);
+    resetNotice ||= sessionResetNotice(prev, msg.playerId);
     backToLobby();
-    if (notice) toast(t(notice), 'warn', { ttl: 7000 });
   } else if (prev.room || prev.match.public) {
     // Resumed session: the server re-pushes room/match state; drop whatever it doesn't.
     store.patch('ui', { restoring: true });
@@ -193,6 +206,7 @@ function onWelcome(msg) {
       store.patch('ui', { restoring: false });
     }, RESTORE_GRACE_MS);
   }
+  if (resetNotice) toast(t(resetNotice), 'warn', { ttl: 7000 });
   schedulePendingJoin();
 }
 
@@ -236,8 +250,12 @@ function wireNet() {
   net.on('clock', (c) => store.set({ clock: { offset: c.offset, rtt: c.rtt, synced: c.synced } }));
   net.on('welcome', onWelcome);
   net.on('helloError', (err) => {
-    if (err.code === 'SESSION_IN_USE') identity.rejectToken();
+    // A refused token stays saved until the user explicitly chooses account recovery.
     toastError(err);
+  });
+  net.on('authRequired', () => {
+    stopAccountPage();
+    location.replace('/auth');
   });
   net.on('replaced', () => toast(t('该身份已在其他页面登录，本页已断开'), 'warn', { ttl: 6000 }));
   net.on('unhandledError', (err) => toastError(err));
@@ -303,7 +321,7 @@ function wireNet() {
  */
 function warmGameData() {
   // a room with gameplay plugins: content.js downloads its content set's files instead (DESIGN §32.6)
-  const go = () => { if (store.get().room?.content?.vanilla === false) return; data.loadAll(GAME_FILES).catch(() => {}); };
+  const go = () => { if (accountPageStopped || store.get().room?.content?.vanilla === false) return; data.loadAll(GAME_FILES).catch(() => {}); };
   if (typeof globalThis.requestIdleCallback === 'function') globalThis.requestIdleCallback(go, { timeout: 2500 });
   else setTimeout(go, 600);
 }
@@ -321,6 +339,37 @@ function ScreenCrashed({ error, reset }) {
   </div>`;
 }
 
+function recoverAccount() {
+  if (accountPageStopped || accountRecoveryStarted || net.lastError?.code !== 'INVALID_RECONNECT') return;
+  accountRecoveryStarted = true;
+  const prev = store.get();
+  net.close();
+  // A restart may have interrupted the lazy ESM graph. Only the explicit action rebuilds this document, not welcome.
+  if (!identity.beginRecovery({ previousPlayerId: prev.me.playerId,
+    notice: prev.match.public || prev.room?.inMatch ? 'match' : prev.room ? 'room' : null })) {
+    accountRecoveryStarted = false;
+    toast(t('无法写入本机存储，可能已满'), 'error');
+    return;
+  }
+  stopAccountPage();
+  location.replace('/');
+}
+
+function AccountConnectionBanner() {
+  const conn = useStore((s) => s.connection);
+  const code = conn.lastError?.code;
+  if (code !== 'SESSION_IN_USE' && code !== 'REPLACED' && code !== 'INVALID_RECONNECT') return html`<${ConnectionBanner} />`;
+  const invalid = code === 'INVALID_RECONNECT';
+  const takeover = () => net.takeOver(net.name || store.get().me.name);
+  return html`<${Modal} open=${true} priority=${true} closeOnBackdrop=${false} class="account-connection"
+    title=${invalid ? t('重新恢复当前账号') : t('接管此账号')}
+    actions=${html`
+      <${Button} variant="secondary" data-autofocus onClick=${invalid ? recoverAccount : takeover}>${invalid ? t('重新恢复当前账号') : t('接管此账号')}<//>
+      <${Button} variant="ghost" onClick=${() => location.replace('/auth')}>${t('返回登录页')}<//>`}>
+    <p class="modal__text" role="alert">${invalid ? t('恢复凭证已失效，尚未清除；可重新恢复当前账号') : t('该账号正在其他页面使用；接管会断开那一页')}</p>
+  <//>`;
+}
+
 function App() {
   const route = useStore(selectRoute);
   useLang(); // a language switch re-renders the whole tree in place
@@ -330,7 +379,7 @@ function App() {
     <div class="app-bg" aria-hidden="true"></div>
     ${error ? html`<${ScreenCrashed} error=${error} reset=${resetError} />` : html`<${Screen} key=${route} />`}
     <${TrustedNotice} />
-    <${ConnectionBanner} />
+    <${AccountConnectionBanner} />
     <${ToastHost} />
     <${UiHosts} />
     <${GuideHost} />
@@ -355,6 +404,7 @@ async function waitForFonts(ms) {
 
 function installGlobalErrorHandlers() {
   window.addEventListener('unhandledrejection', (ev) => {
+    if (accountPageStopped) return;
     const err = ev.reason;
     // Media autoplay/abort rejections (audio.play() before a user gesture, interrupted loads) are
     // expected browser behaviour, not app errors: log quietly, never toast.
@@ -371,7 +421,37 @@ function installGlobalErrorHandlers() {
   });
 }
 
+function stopAccountPage() {
+  if (accountPageStopped) return;
+  accountPageStopped = true;
+  accounts.suspendAccount();
+  // Terminal before logout: stop traffic and prevent this document's caches from being reused by another login.
+  try { stopPluginFrames?.(); } catch (err) { console.warn('[accounts] plugin cleanup failed', err); }
+  setAccountScope(null);
+  net?.setAccount(null);
+  identity?.setAccount(null);
+  clearTimeout(restoreTimer); clearTimeout(joinTimer);
+  try { rehearsal?.clear(); } catch (err) { console.warn('[accounts] rehearsal cleanup failed', err); }
+  try { closeAllDialogs?.(); } catch (err) { console.warn('[accounts] dialog cleanup failed', err); }
+  try { buildGuard?.stop(); } catch (err) { console.warn('[accounts] build guard cleanup failed', err); }
+  buildGuard = null;
+  store.reset();
+  if (typeof render === 'function') render(null, document.getElementById('app'));
+}
+
 async function boot() {
+  accounts.configureAccountLifecycle({ stop: stopAccountPage, navigate: (path) => location.replace(path) });
+  const verifiedAccount = await accounts.refreshAccount();
+  if (accountPageStopped) return;
+  if (!verifiedAccount?.id || !/^a_[0-9a-f]{32}$/.test(verifiedAccount.id)) { location.replace('/auth'); return; }
+  setAccountScope(verifiedAccount.id);
+  ({ net, identity, NetError } = await import('./net.js'));
+  if (accountPageStopped) { net.setAccount(null); identity.setAccount(null); return; }
+  identity.setAccount(verifiedAccount);
+  net.setAccount(verifiedAccount);
+  await loadGameGraph();
+  if (accountPageStopped) { stopPluginFrames?.(); return; }
+  accounts.startAccounts();
   installGlobalErrorHandlers();
   // what this page downloads, by category, for the 问题反馈 report's traffic line (diag.js; nothing is sent anywhere)
   installTrafficMeter();
@@ -381,11 +461,11 @@ async function boot() {
   void registerImportedAssetWorker();
   // A page restored from the back/forward cache has a dead socket and a stale token choice: start over.
   window.addEventListener('pageshow', (ev) => { if (ev.persisted) location.reload(); });
-  // Pick this tab's reconnect token (asks other live tabs; ≤150 ms) while fonts load.
+  // Only after the HTTP account binding may this tab restore its game reconnect claim.
   const identityReady = identity.init();
 
   const pendingJoin = parseRoomParam(location.search);
-  const savedName = sanitizeName(identity.loadName());
+  const savedName = sanitizeName(identity.loadName() || verifiedAccount.name);
   const entered = identity.wasEntered() && !!savedName;
   store.set((s) => ({
     me: { ...s.me, name: savedName },
@@ -424,12 +504,14 @@ async function boot() {
   data.load('local').catch(() => {});
 
   const connectWhenReady = identityReady.then(() => {
+    if (accountPageStopped) return;
     if (entered) net.setName(savedName);
     else net.connect();
   });
   // the language (and its UI translations) before the first render: no Chinese flash for an English player
   const langReady = initLang().catch((err) => console.warn('[app] language setup failed', err));
   await Promise.all([waitForFonts(1200), connectWhenReady, langReady]);
+  if (accountPageStopped) return;
   const root = document.getElementById('app');
   render(html`<${App} />`, root);
 
@@ -444,11 +526,12 @@ async function boot() {
   // so instead (the connection banner offers 刷新页面) and reloads once the match — settlement screen included — is over,
   // so a running game is never thrown away.
   try {
-    startBuildGuard({
+    buildGuard = startBuildGuard({
       inMatch: () => selectRoute(store.get()) === 'game',
-      onStale: ({ waiting }) => { if (waiting) store.patch('ui', { buildStale: true }); },
+      onStale: ({ waiting }) => { if (!accountPageStopped && waiting) store.patch('ui', { buildStale: true }); },
       // the same /healthz names how many plugins the server has: the title screen shows it before any hello
       onHealth: (h) => {
+        if (accountPageStopped) return;
         const n = pluginCount(h.content), notices = h.content?.notices === true;
         if (n !== store.get().installedPlugins || notices !== store.get().installedNotices) store.set({ installedPlugins: n, installedNotices: notices });
       },
@@ -459,6 +542,7 @@ async function boot() {
 }
 
 boot().catch((err) => {
+  if (accountPageStopped) return;
   console.error('[app] boot failed', err);
   const el = document.getElementById('boot-err');
   if (el) el.textContent = t('启动失败，请刷新页面重试');

@@ -10,8 +10,8 @@
 // Steps, in the order of ci.yml (job `test`, then job `tooling`):
 //   setup      node tools/setup.mjs --check --no-local
 //   test       npm test: node --test over TEST_FILES (package.json "test")
-//   smoke      the server on a free port on 127.0.0.1: GET /healthz, / (must contain <html) and /vendor/pixi.min.js,
-//              then node tools/doctor.mjs (its exit code is ignored, like `|| true` in ci.yml), then the server stops
+//   smoke      real CLI on loopback with owned temporary state/secrets, real HTTP admission/account login,
+//              authenticated health + byte-exact index/vendor, then doctor's strict stdin-auth probe; always clean up
 //   lint       eslint .                                   (npm run lint; warnings do not fail it)
 //   imports    node tools/check-imports.mjs               (npm run check:imports)
 //   typecheck  tsc --noEmit --checkJs -p jsconfig.json    (npm run typecheck)
@@ -24,18 +24,24 @@
 // test/ci.test.js keeps this list and ci.yml in step: a ci.yml step this file does not know fails it.
 
 import { spawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
+import { isFullHealth } from './doctor.mjs';
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 /** The env of ci.yml's job `test` (test/ci.test.js compares it with the workflow). */
 export const CI_TEST_ENV = { SP_E2E: '0', SP_REAL_E2E: '0', RENDER_E2E: '0', NO_COLOR: '1' };
 
-/** The paths the smoke step requests (the curl URLs of ci.yml's smoke step; test/ci.test.js compares them). */
+/** The real game resources checked after HTTP admission and account authentication. */
 export const SMOKE_PATHS = ['/healthz', '/', '/vendor/pixi.min.js'];
+export const SMOKE_COMMAND = 'node tools/ci.mjs --only smoke';
 
 /**
  * The test files `npm test` runs (package.json "test", which ci.yml runs): every *.test.js under test/, the browser E2E
@@ -199,9 +205,27 @@ export function selectSteps(only) {
   return only ? STEPS.filter((s) => only.includes(s.id)) : STEPS.slice();
 }
 
-/** A child's env: `base` plus ci.yml's job env for the keys `base` does not set. */
+// Smoke is not a deployment: select names before touching values (including getters in regression tests).
+// Only platform/process necessities survive. In particular no auth/state/*_FILE, Node/native preload,
+// inherited listener, proxy, studio or application settings can reach either smoke child.
+const SMOKE_ENV_NAMES = new Set([
+  'PATH', 'PATHEXT', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'SYSTEMDRIVE',
+  'TEMP', 'TMP', 'TMPDIR', 'HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA',
+  'LANG', 'LANGUAGE', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TERM', 'CI', 'NO_COLOR',
+]);
+export function smokeEnvironment(source = process.env) {
+  const env = {};
+  for (const key of Object.keys(source)) {
+    if (!SMOKE_ENV_NAMES.has(key.toUpperCase())) continue;
+    const value = source[key];
+    if (typeof value === 'string') env[key] = value;
+  }
+  return Object.assign(env, CI_TEST_ENV);
+}
+
+/** Other steps retain their old env contract; smoke filters before any inherited value is read. */
 export function stepEnv(step, base = process.env) {
-  const env = { ...base };
+  const env = step.id === 'smoke' ? smokeEnvironment(base) : { ...base };
   if (step.ci.job === 'test') for (const [k, v] of Object.entries(CI_TEST_ENV)) if (env[k] === undefined) env[k] = v;
   return env;
 }
@@ -273,7 +297,7 @@ process.on('exit', () => { for (const c of servers) { try { c.kill('SIGKILL'); }
 
 /** Stop a server child: SIGTERM (graceful on POSIX; on Windows kill() terminates), SIGKILL after 8 s. */
 function stopServer(child) {
-  if (child.exitCode !== null || child.signalCode !== null) { servers.delete(child); return Promise.resolve(); }
+  if (!child.pid || child.exitCode !== null || child.signalCode !== null) { servers.delete(child); return Promise.resolve(); }
   return new Promise((resolve) => {
     const force = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } }, 8000);
     child.once('exit', () => { clearTimeout(force); servers.delete(child); resolve(); });
@@ -281,53 +305,174 @@ function stopServer(child) {
   });
 }
 
-/** The smoke step of ci.yml's job `test`, on a free port instead of 3000 (a running game server must not clash). */
-async function smoke(env) {
-  const port = await freePort();
-  // [ASSUMED] HOST=127.0.0.1 instead of the unset-HOST default (::): the requests go to 127.0.0.1 either way, and
-  // listening only on loopback spares a firewall prompt on Windows / macOS.
-  const child = spawn(process.execPath, ['server/index.js'], {
-    cwd: ROOT, env: { ...env, PORT: String(port), HOST: '127.0.0.1' }, stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  servers.add(child);
-  let log = '';
-  child.stdout.on('data', (d) => { log += d; });
-  child.stderr.on('data', (d) => { log += d; });
-  const base = `http://127.0.0.1:${port}`;
-  const fail = async (msg) => {
-    await stopServer(child);
-    console.error(`smoke: ${msg}\n── server log ──\n${log}`);
-    return 1;
-  };
-  try {
-    let health = null;
-    for (let i = 0; i < 30 && !health; i++) {
-      if (child.exitCode !== null) return await fail(`the server exited (code ${child.exitCode})`);
-      try {
-        const r = await fetch(base + '/healthz', { signal: AbortSignal.timeout(2000) });
-        if (r.ok) health = await r.text();
-      } catch { /* not up yet */ }
-      if (!health) await new Promise((r) => setTimeout(r, 1000));
-    }
-    if (!health) return await fail(`no 200 from ${base}/healthz within 30 s`);
-    console.log(`GET /healthz → ${health.trim()}`);
-    const index = await fetch(base + '/', { signal: AbortSignal.timeout(10000) });
-    const html = await index.text();
-    if (!index.ok) return await fail(`GET / → HTTP ${index.status}`);
-    if (!/<html/i.test(html)) return await fail('GET / does not contain <html');
-    console.log(`GET / → ${index.status}, ${html.length} bytes, <html found`);
-    const pixi = await fetch(base + '/vendor/pixi.min.js', { signal: AbortSignal.timeout(10000) });
-    await pixi.arrayBuffer();
-    if (!pixi.ok) return await fail(`GET /vendor/pixi.min.js → HTTP ${pixi.status} (public/vendor missing? node tools/vendor.mjs)`);
-    console.log(`GET /vendor/pixi.min.js → ${pixi.status}`);
-    // ci.yml: `node tools/doctor.mjs || true` — its exit code does not fail the step.
-    const doctor = await node(['tools/doctor.mjs', '--port', String(port), '--host', '127.0.0.1'], env);
-    if (doctor !== 0) console.log(`(doctor exited ${doctor}; ignored, as in ci.yml)`);
-  } catch (e) {
-    return await fail(e?.message || String(e));
+/** Literal loopback HTTP only: no proxy/redirect machinery and no destination from credentials or environment. */
+export function smokeRequest(port, rawPath, { method = 'GET', headers = {}, body } = {}) {
+  if (!Number.isInteger(port) || port < 1 || port > 65535 || !/^\/(?!\/)[^\r\n]*$/.test(rawPath)) {
+    throw new Error('Invalid smoke request target');
   }
-  await stopServer(child);
-  return 0;
+  return new Promise((resolve, reject) => {
+    const payload = body === undefined ? null : Buffer.from(JSON.stringify(body));
+    const req = http.request({
+      hostname: '127.0.0.1', port, path: rawPath, method, agent: false, timeout: 10000,
+      headers: { 'Accept-Encoding': 'identity', ...headers,
+        ...(payload ? { 'Content-Type': 'application/json', 'Content-Length': payload.length } : {}) },
+    }, res => {
+      const chunks = [];
+      let size = 0;
+      res.on('data', chunk => {
+        size += chunk.length;
+        if (size > 16 * 1024 * 1024) req.destroy(new Error('Smoke response too large'));
+        else chunks.push(chunk);
+      });
+      res.on('error', () => reject(new Error('Smoke response interrupted')));
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
+    });
+    req.on('error', e => reject(new Error(`Smoke HTTP request failed (${e.code || 'HTTP_ERROR'})`)));
+    req.on('timeout', () => req.destroy(new Error('Smoke request timed out')));
+    req.end(payload);
+  });
+}
+
+function smokeJson(response, label) {
+  if (response.status !== 200) throw new Error(`${label}: HTTP ${response.status}, expected 200`);
+  if (!/^application\/json\b/i.test(response.headers['content-type'] || '')) throw new Error(`${label}: expected JSON`);
+  try { return JSON.parse(response.body.toString('utf8')); }
+  catch { throw new Error(`${label}: invalid JSON`); }
+}
+
+/** One bounded real account, registered then logged in over the same admission/CSRF HTTP protocol as the UI. */
+export async function smokeAccount(port, entryToken, password) {
+  const jar = new Map();
+  const origin = `http://127.0.0.1:${port}`;
+  let csrf;
+  const cookie = () => [...jar].map(([name, value]) => `${name}=${value}`).join('; ');
+  const request = async (route, body) => {
+    const response = await smokeRequest(port, route, {
+      method: body === undefined ? 'GET' : 'POST', body,
+      headers: { Origin: origin, Cookie: cookie(), ...(csrf ? { 'X-CSRF-Token': csrf } : {}) },
+    });
+    const json = smokeJson(response, route);
+    for (const line of response.headers['set-cookie'] || []) {
+      const pair = line.split(';', 1)[0], eq = pair.indexOf('=');
+      const name = pair.slice(0, eq), value = pair.slice(eq + 1);
+      if (!['sp_gate', 'sp_session', 'sp_csrf'].includes(name)) throw new Error('Unexpected smoke auth cookie');
+      if (!value || /;\s*Max-Age=0(?:;|$)/i.test(line)) jar.delete(name);
+      else jar.set(name, value);
+    }
+    csrf = json.csrf;
+    if (!/^[a-f0-9]{64}$/.test(csrf || '') || jar.get('sp_csrf') !== csrf) throw new Error('Smoke CSRF bootstrap failed');
+    return json;
+  };
+  const initial = await request('/auth/status');
+  if (initial.admitted !== false || initial.account !== null || initial.registrationOpen !== true) throw new Error('Smoke state is not fresh');
+  if ((await request('/auth/admit', { token: entryToken })).admitted !== true) throw new Error('Smoke admission failed');
+  const username = 'ci_smoke';
+  const registered = await request('/auth/register', { username, password, name: 'CI Smoke' });
+  const id = registered.account?.id;
+  if (!/^a_[a-f0-9]{32}$/.test(id || '') || registered.account.username !== username) throw new Error('Smoke registration failed');
+  const loggedIn = await request('/auth/login', { username, password });
+  if (loggedIn.account?.id !== id) throw new Error('Smoke login changed account');
+  const status = await request('/auth/status');
+  if (status.admitted !== true || status.account?.id !== id || !jar.has('sp_gate') || !jar.has('sp_session')) {
+    throw new Error('Smoke account session was not established');
+  }
+  return { cookie: cookie() };
+}
+
+/** Strict 200, complete health, and byte-exact real game files: an auth page can never satisfy the index check. */
+export function checkSmokeResponse(route, response, expected = null) {
+  if (response.status !== 200) throw new Error(`${route}: HTTP ${response.status}, expected 200`);
+  if (route === '/healthz') {
+    if (!isFullHealth(smokeJson(response, route))) throw new Error('Authenticated full health required');
+    return;
+  }
+  const type = response.headers['content-type'] || '';
+  if (route === '/' ? !/^text\/html\b/i.test(type) : !/^(?:text|application)\/javascript\b/i.test(type)) {
+    throw new Error(`${route}: unexpected MIME type`);
+  }
+  if (!Buffer.isBuffer(expected) || !expected.length || !response.body.equals(expected)) throw new Error(`${route}: not the real game file`);
+  if (route === '/' && !/<script\b[^>]*\bsrc=["']\/js\/main\.js["']/i.test(response.body.toString('utf8'))) {
+    throw new Error('Game index entry missing');
+  }
+}
+
+function smokeDoctor(port, auth, env) {
+  return new Promise(resolve => {
+    const child = spawn(process.execPath, ['tools/doctor.mjs', '--auth-stdin', '--port', String(port), '--host', '127.0.0.1'], {
+      cwd: ROOT, env, stdio: ['pipe', 'inherit', 'inherit'],
+    });
+    servers.add(child);
+    const timer = setTimeout(() => { child.kill('SIGKILL'); }, 10000);
+    child.once('error', () => { clearTimeout(timer); servers.delete(child); resolve(1); });
+    child.once('close', code => { clearTimeout(timer); servers.delete(child); resolve(code ?? 1); });
+    child.stdin.on('error', () => { /* exit/timeout is checked, never print credential-bearing stream errors */ });
+    child.stdin.end(JSON.stringify(auth));
+  });
+}
+
+/** Shared workflow/local smoke. No deployment files are loaded; only this invocation's root may be removed. */
+async function smoke(env) {
+  let root, child, log = '';
+  const secrets = [];
+  try {
+    const safe = smokeEnvironment(env), port = await freePort();
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'sp-ci-smoke-'));
+    const state = path.join(root, 'state');
+    fs.mkdirSync(state, { mode: 0o700 });
+    const entryToken = randomBytes(32).toString('hex'), sessionSecret = randomBytes(32).toString('hex');
+    const password = randomBytes(24).toString('hex');
+    secrets.push(entryToken, sessionSecret, password);
+    const childEnv = { ...safe, PORT: String(port), HOST: '127.0.0.1', TRUST_PROXY: '0',
+      SP_STATE_DIR: state, SP_AUTH_ORIGIN: `http://127.0.0.1:${port}`, SP_AUTH_ALLOW_HTTP: '1',
+      SP_ENTRY_TOKEN: entryToken, SP_SESSION_SECRET: sessionSecret, SP_REGISTRATION_OPEN: '1',
+      SP_STUDIO: 'off', SP_PLUGIN_SCRIPTS: 'off', SP_ASSET_INDEX: '0' };
+    child = spawn(process.execPath, ['server/index.js'], { cwd: ROOT, env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+    servers.add(child);
+    const record = bytes => { log = (log + bytes.toString('utf8')).slice(-65536); };
+    child.stdout.on('data', record);
+    child.stderr.on('data', record);
+    await new Promise((resolve, reject) => {
+      child.once('spawn', resolve);
+      child.once('error', () => reject(new Error('Smoke server could not start')));
+    });
+    let ready = false;
+    for (let i = 0; i < 30 && !ready; i++) {
+      if (child.exitCode !== null || child.signalCode !== null) throw new Error('Smoke server exited before readiness');
+      try {
+        const json = smokeJson(await smokeRequest(port, '/healthz'), '/healthz');
+        ready = json.ok === true && Object.keys(json).length === 1;
+      } catch { /* not listening yet */ }
+      if (!ready) await delay(1000);
+    }
+    if (!ready) throw new Error('No anonymous readiness within 30 attempts');
+    const anonymousIndex = await smokeRequest(port, '/');
+    const anonymousVendor = await smokeRequest(port, '/vendor/pixi.min.js');
+    if (anonymousIndex.status !== 303 || anonymousIndex.headers.location !== '/auth/' || anonymousVendor.status !== 401) {
+      throw new Error('Anonymous game boundary changed');
+    }
+    console.log('smoke: anonymous readiness and game auth boundary verified');
+    const auth = await smokeAccount(port, entryToken, password);
+    secrets.push(auth.cookie);
+    console.log('smoke: one account registered and logged in through real HTTP admission');
+    for (const route of SMOKE_PATHS) {
+      const response = await smokeRequest(port, route, { headers: { Cookie: auth.cookie } });
+      const file = route === '/' ? 'public/index.html' : route === '/vendor/pixi.min.js' ? 'public/vendor/pixi.min.js' : null;
+      checkSmokeResponse(route, response, file ? fs.readFileSync(path.join(ROOT, file)) : null);
+      console.log(`smoke: authenticated GET ${route} → 200${file ? ', real file verified' : ', full health verified'}`);
+    }
+    const code = await smokeDoctor(port, auth, safe);
+    if (code !== 0) throw new Error(`Authenticated doctor failed (exit ${code})`);
+    return 0;
+  } catch (e) {
+    let detail = `${e?.message || 'Smoke failed'}\n── server log ──\n${log}`;
+    for (const value of secrets) detail = detail.replaceAll(value, '[redacted]');
+    detail = detail.replace(/sp_(?:gate|session|csrf)=[^\s;]+/g, '[redacted-cookie]');
+    console.error(`smoke: ${detail}`);
+    return 1;
+  } finally {
+    if (child) await stopServer(child);
+    if (root) fs.rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+  }
 }
 
 /** @param {Step} step @param {Record<string, string | undefined>} env */

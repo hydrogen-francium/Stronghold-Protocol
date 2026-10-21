@@ -3,8 +3,9 @@
 // art compositor, the plugin panel or the asset store. With no interface plugin switched on, and on a server that
 // reports none, it does not ask for the catalogue.
 //
-// Each switched-on plugin is one <iframe sandbox="allow-scripts"> (no allow-same-origin: an opaque origin, so it has
-// no site storage and no credentials). The same `sandbox allow-scripts` is on the /p/ response (UI_FRAME_CSP), because
+// Each switched-on plugin is one <iframe sandbox="allow-scripts"> (no allow-same-origin: an opaque origin, so it cannot
+// read site storage or credentials). The initial /p/ navigation needs the host's authentication cookies; the sandbox
+// and independent CSP confine the loaded document. The same `sandbox allow-scripts` is on the /p/ response, because
 // the attribute is not there when the URL is opened at the top level. The parent posts with targetOrigin '*' because
 // that origin is the string "null" — 'null' does not tell the entry document from a later opaque one.
 // Loads: 1 is the entry (the iframe points straight at it), 2+ destroys the frame and stops the feed. A message is applied on
@@ -19,7 +20,7 @@
 // per slot. When several plugins prefer the same slot, the first by name is shown and the player switches the
 // others with tabs in the slot. Nothing here calls net.send. A match intent is rejected locally.
 
-import { store } from '../store.js';
+import { getAccountScope, prefStorageKey, store } from '../store.js';
 import { battleRunner } from '../battle/runner.js';
 import { catalog, loadCatalog, installedCount, pluginName } from '../content.js';
 import { toast } from './toasts.js';
@@ -53,20 +54,24 @@ const api = {
   last: null,
   frames: () => [...frames.keys()],
   debugBattle(events) {
+    if (stopped) return;
     const msg = battlePayload({ fieldId: 'debug', gt: 0, events, snap: null });
     api.last = msg;
-    for (const rec of frames.values()) post(rec, msg);
+    for (const rec of frames.values()) if (!rec.preview) post(rec, msg);
   },
 };
 
 /**
  * @typedef {{ id: string, iframe: HTMLIFrameElement, declared: string[], entry: any, ready: boolean,
- *   preview?: any, entries: Record<string, string>, limitAt: number, loads: number, closed: boolean,
+ *   accountId: string | null, preview?: any, entries: Record<string, string>, limitAt: number, loads: number, closed: boolean,
  *   netAt?: number | null, netText?: string }} FrameRec
  */
 
 let park = null;
 let booted = false;
+let stopped = false;
+const cleanups = [];
+const queuedMessages = new Set();
 let stateTimer = 0;
 let lastState = '';
 let netTimer = 0;
@@ -88,14 +93,20 @@ function parkEl() {
   return park;
 }
 
+/** A game frame belongs to the account that mounted it; preview documents only receive fake state. */
+function frameCurrent(rec) {
+  return !stopped && !rec.closed && frames.get(rec.id) === rec &&
+    (!!rec.preview || (!!rec.accountId && getAccountScope() === rec.accountId));
+}
+
 /** @param {FrameRec} rec @param {object} msg */
 /** Private feed only while the entry document is the one that finished loading. */
 function feeding(rec) {
-  return !rec.closed && frames.get(rec.id) === rec && rec.ready && frameLoadDecision(rec.loads) === 'entry';
+  return frameCurrent(rec) && rec.ready && frameLoadDecision(rec.loads) === 'entry';
 }
 
 function post(rec, msg) {
-  if (rec.closed || frames.get(rec.id) !== rec) return;
+  if (!frameCurrent(rec)) return;
   const w = rec.iframe.contentWindow;
   if (!w) return;
   try {
@@ -110,6 +121,8 @@ function destroy(id) {
   if (!rec) return;
   rec.closed = true;
   rec.ready = false;
+  rec.entries = Object.create(null);
+  if (rec.preview?.timer) clearInterval(rec.preview.timer);
   frames.delete(id);
   for (const [slot, held] of chosenSlot) if (held === id) chosenSlot.delete(slot);
   slots.release(id);
@@ -128,6 +141,27 @@ function stopForLeaving(id) {
 
 function destroyAll() {
   for (const id of [...frames.keys()]) destroy(id);
+}
+
+/** Terminal for this document: logout/account replacement must not revive old frames or queued private feeds. */
+export function stopPluginFrames() {
+  if (stopped) return;
+  stopped = true;
+  for (const timer of [stateTimer, netTimer, battleTimer, ...queuedMessages]) clearTimeout(timer);
+  stateTimer = netTimer = battleTimer = 0;
+  queuedMessages.clear();
+  for (const off of cleanups.splice(0)) {
+    try { off(); } catch { /* continue closing the remaining feeds */ }
+  }
+  destroyAll();
+  chosenSlot.clear();
+  battleQueue = [];
+  battleField = battleGt = lastSnap = null;
+  lastState = lastResultText = '';
+  api.last = null;
+  rejected.length = 0;
+  park?.remove();
+  park = null;
 }
 
 /**
@@ -252,6 +286,7 @@ function renderSlotTabs() {
 }
 
 function placeAll() {
+  if (stopped) return;
   assignSlots();
   for (const rec of frames.values()) place(rec);
   renderSlotTabs();
@@ -271,6 +306,8 @@ function autoGrant(id, declared) {
 
 /** @param {any} entry */
 function mount(entry, preview = null) {
+  const accountId = getAccountScope();
+  if (stopped || (!preview && !accountId)) return;
   const id = entry.id;
   if (frames.has(id) || frames.size >= UI_LIMITS.maxPlugins) return;
   const rel = typeof entry.entry === 'string' ? entry.entry : null;
@@ -282,16 +319,15 @@ function mount(entry, preview = null) {
   iframe.className = 'ui-slot__frame';
   iframe.setAttribute('sandbox', 'allow-scripts');
   iframe.referrerPolicy = 'no-referrer';
-  iframe.setAttribute('credentialless', '');
   iframe.setAttribute('allow', '');
   iframe.title = pluginName(entry) || id;
   iframe.dataset.plugin = id;
   /** @type {FrameRec} */
-  const rec = { id, iframe, declared, entry, ready: false, preview, entries: preview ? Object.create(null) : loadEntries(id), limitAt: 0, loads: 0, closed: false };
+  const rec = { id, iframe, declared, entry, accountId, ready: false, preview, entries: preview ? Object.create(null) : loadEntries(id), limitAt: 0, loads: 0, closed: false };
   frames.set(id, rec);
   autoGrant(id, declared);
   iframe.addEventListener('load', () => {
-    if (frames.get(id) !== rec || rec.closed) return;
+    if (!frameCurrent(rec)) return;
     rec.loads += 1;
     const decision = frameLoadDecision(rec.loads);
     if (decision === 'destroy') { stopForLeaving(id); return; }
@@ -310,7 +346,8 @@ function mount(entry, preview = null) {
 function loadEntries(id) {
   /** @type {Record<string, string>} */
   const entries = Object.create(null);
-  const prefix = `sp.plugin.${id}.`;
+  const prefix = prefStorageKey(`sp.plugin.${id}.`);
+  if (!prefix) return entries;
   let ls;
   try { ls = globalThis.localStorage; } catch { return entries; }
   if (!ls) return entries;
@@ -365,9 +402,10 @@ function postNetNow(rec) {
 }
 
 function scheduleState() {
-  if (stateTimer) return;
+  if (stopped || stateTimer) return;
   stateTimer = window.setTimeout(() => {
     stateTimer = 0;
+    if (stopped) return;
     const s = store.get();
     const m = s.match;
     const msg = hostState(m && m.public, m && m.private, s.room);
@@ -375,12 +413,12 @@ function scheduleState() {
     try { text = JSON.stringify(msg); } catch { return; }
     if (text === lastState) return;
     lastState = text;
-    for (const rec of frames.values()) if (feeding(rec)) post(rec, msg);
+    for (const rec of frames.values()) if (feeding(rec) && !rec.preview) post(rec, msg);
   }, STATE_MS);
 }
 
 function scheduleNet() {
-  if (netTimer) return;
+  if (stopped || netTimer) return;
   const msg = hostNet(store.get().connection);
   let text = '';
   try { text = JSON.stringify(msg); } catch { return; }
@@ -399,6 +437,7 @@ function scheduleNet() {
 }
 
 function scheduleResult() {
+  if (stopped) return;
   const m = store.get().match;
   const msg = hostResult(m && m.result);
   let text = '';
@@ -410,14 +449,15 @@ function scheduleResult() {
 
 function flushBattle() {
   battleTimer = 0;
+  if (stopped) return;
   const events = battleQueue;
   battleQueue = [];
   const msg = battlePayload({ fieldId: battleField, gt: battleGt, events, snap: lastSnap });
-  for (const rec of frames.values()) if (feeding(rec)) post(rec, msg);
+  for (const rec of frames.values()) if (feeding(rec) && !rec.preview) post(rec, msg);
 }
 
 function scheduleBattle() {
-  if (battleTimer) return;
+  if (stopped || battleTimer) return;
   battleTimer = window.setTimeout(flushBattle, SLOT_MS);
 }
 
@@ -432,13 +472,16 @@ function noteLimit(rec) {
 
 /** @param {FrameRec} rec @param {Record<string, unknown>} msg */
 function onStorage(rec, msg) {
+  if (!frameCurrent(rec)) return;
   const op = msg.op;
   const key = typeof msg.key === 'string' ? msg.key : '';
   if (op === 'keys') {
     post(rec, { v: 1, t: 'storage', op: 'keys', keys: Object.keys(rec.entries), ok: true });
     return;
   }
-  const full = namespacedStorageKey(rec.id, key);
+  const namespace = namespacedStorageKey(rec.id, key);
+  // Studio previews keep only their in-memory entries; game plugins require a bound account.
+  const full = namespace && (rec.preview ? namespace : prefStorageKey(namespace));
   if (!full) {
     post(rec, { v: 1, t: 'storage', op, key, ok: false, error: UI_ERRORS.PLUGIN_STORAGE });
     return;
@@ -478,6 +521,7 @@ function onStorage(rec, msg) {
 
 /** @param {FrameRec} rec @param {Record<string, unknown>} msg */
 function handle(rec, msg) {
+  if (!frameCurrent(rec)) return;
   if (msg.t === 'ready') {
     // Only the entry document may initialize, once. Duplicate ready must not bypass feed throttling.
     // welcome is posted from the load handler, not from here, so a plugin that answers welcome cannot loop.
@@ -529,11 +573,12 @@ function handle(rec, msg) {
 }
 
 function onWindowMessage(ev) {
+  if (stopped) return;
   let rec = null;
   for (const item of frames.values()) {
     if (item.iframe.contentWindow && item.iframe.contentWindow === ev.source) { rec = item; break; }
   }
-  if (!rec) return;
+  if (!rec || !frameCurrent(rec)) return;
   if (ev.origin !== 'null') return;
   const verdict = validatePluginMessage(ev.data);
   const allowed = limiter.allow(rec.id);
@@ -551,14 +596,21 @@ function onWindowMessage(ev) {
   // Applying the message on the next turn lets a navigation that already queued its load destroy the frame first,
   // so ready on the new document does not pull state. A task that was queued even earlier can still post once
   // (DESIGN §32.8 [ASSUMED]).
-  setTimeout(() => {
-    if (frames.get(rec.id) !== rec || rec.closed) return;
+  const timer = setTimeout(() => {
+    queuedMessages.delete(timer);
+    if (!frameCurrent(rec)) return;
     if (frameLoadDecision(rec.loads) === 'destroy') { stopForLeaving(rec.id); return; }
     handle(rec, msg);
   }, 0);
+  queuedMessages.add(timer);
 }
 
 function sync() {
+  if (stopped) return;
+  if (!getAccountScope()) {
+    for (const rec of [...frames.values()]) if (!rec.preview) destroy(rec.id);
+    return;
+  }
   const ids = uiPlugins.get().ids;
   if (!ids.length) { destroyAll(); return; }
   if (!installedCount(store.get())) return;
@@ -583,11 +635,13 @@ function sync() {
 }
 
 function boot() {
-  if (booted || typeof window === 'undefined' || typeof document === 'undefined') return;
+  if (stopped || booted || typeof window === 'undefined' || typeof document === 'undefined') return;
   booted = true;
   globalThis.__SP_UI_PLUGINS__ = api;
   window.addEventListener('message', onWindowMessage);
+  cleanups.push(() => window.removeEventListener('message', onWindowMessage));
   const obs = new MutationObserver((records) => {
+    if (stopped) return;
     let changed = false;
     for (const rec of records) {
       for (const node of rec.removedNodes) if (rescue(node)) changed = true;
@@ -599,45 +653,52 @@ function boot() {
     }
     if (changed) placeAll();
   });
+  cleanups.push(() => obs.disconnect());
   const arm = () => {
-    if (!document.body) return;
+    if (stopped || !document.body) return;
     parkEl();
     obs.observe(document.body, { childList: true, subtree: true });
     sync();
   };
   if (document.body) arm();
-  else document.addEventListener('DOMContentLoaded', arm, { once: true });
-  uiPlugins.subscribe(() => sync());
-  catalog.subscribe(() => sync());
-  store.subscribe((s, prev) => {
+  else {
+    document.addEventListener('DOMContentLoaded', arm, { once: true });
+    cleanups.push(() => document.removeEventListener('DOMContentLoaded', arm));
+  }
+  cleanups.push(uiPlugins.subscribe(() => sync()));
+  cleanups.push(catalog.subscribe(() => sync()));
+  cleanups.push(store.subscribe((s, prev) => {
+    if (stopped) return;
     if (!prev || s.installedPlugins !== prev.installedPlugins) sync();
     if (!prev || s.match !== prev.match || s.room !== prev.room) scheduleState();
     if (!prev || s.connection !== prev.connection) scheduleNet();
     if (!prev || s.match !== prev.match || (s.match && prev.match && s.match.result !== prev.match.result)) scheduleResult();
-  });
+  }));
   if (battleRunner && typeof battleRunner.on === 'function') {
-    battleRunner.on('ev', (payload) => {
+    cleanups.push(battleRunner.on('ev', (payload) => {
+      if (stopped) return;
       const list = payload && Array.isArray(payload.ev) ? payload.ev : [];
       for (const ev of list) battleQueue.push(ev);
       while (battleQueue.length > UI_LIMITS.battleBatch) battleQueue.shift();
       if (payload && typeof payload.fieldId === 'string') battleField = payload.fieldId;
       if (payload && typeof payload.gt === 'number') battleGt = payload.gt;
       scheduleBattle();
-    });
-    battleRunner.on('snap', (frame) => {
+    }));
+    cleanups.push(battleRunner.on('snap', (frame) => {
+      if (stopped) return;
       lastSnap = frame;
       if (frame && typeof frame.fieldId === 'string') battleField = frame.fieldId;
       if (frame && typeof frame.gt === 'number') battleGt = frame.gt;
       scheduleBattle();
-    });
+    }));
   }
 }
 
 /** Studio preview through the exact game host. [ASSUMED] Only fake state and volatile storage; never gameplay data. */
 export function mountPluginPreview(entry, host) {
-  if (!host || !entry || entry.class !== 'ui') return null;
+  if (stopped || !host || !entry || entry.class !== 'ui') return null;
   destroy(entry.id);
-  const preview = { host, state: { public: { phase: 'COMBAT', round: 1, players: [] }, private: { playerId: 'preview', funds: 10 } } };
+  const preview = { host, timer: 0, state: { public: { phase: 'COMBAT', round: 1, players: [] }, private: { playerId: 'preview', funds: 10 } } };
   mount(entry, preview);
   const rec = frames.get(entry.id);
   if (!rec) return null;
@@ -647,6 +708,7 @@ export function mountPluginPreview(entry, host) {
     gt += 1;
     post(rec, battlePayload({ fieldId: 'preview', gt, events: [['dmg', 1, 120, 'phys']], snap: null }));
   }, 1000);
+  preview.timer = timer;
   return { close() { clearInterval(timer); if (frames.get(entry.id) === rec) destroy(entry.id); } };
 }
 

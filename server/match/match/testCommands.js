@@ -400,7 +400,9 @@ export class MatchTestCommands {
     return OK;
   }
 
+  /** 将测试选择交给当前阶段的正式入口，个人机变同样校验修订标识，不绕过发奖限制。 */
   _testChoice(ps, idx, choiceId) {
+    if (this.phase === PHASE.SP_DRAFT && this.sp?.personal) return this.pickCard(ps, idx, choiceId);
     if (choiceId !== undefined) return this.pickPersonalChoice(ps, idx, choiceId);
     if (this.phase !== PHASE.SP_DRAFT) return fail(ERR.WRONG_PHASE);
     return this.pickCard(ps, idx);

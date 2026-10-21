@@ -12,6 +12,7 @@ import { PlayerAvatar } from './gameComponents.js';
 import { uiUrl } from './assetUrls.js';
 import { data } from '../data.js';
 import { t } from '../../../shared/i18n.js';
+import { MAX_SEATS } from '../../../shared/constants.js';
 
 const cx = (...p) => p.flat().filter(Boolean).join(' ');
 
@@ -51,22 +52,23 @@ export function preloadBootArt() {
 }
 
 /**
- * Where the doctors' cards sit on the 1920×1080 stage (design px, measured from the footage): 01 / 03 on the left,
- * 02 / 04 on the right, each with its line from the card's inner edge to a node on the ship; a solo run's one card
- * under the ring. [ASSUMED] the footage shows four doctors only: five or six take a third row (all moved up half a
- * row), and the solo card's place is estimated.
- * @param {number} n players
+ * 按实际人数计算开场卡片位置；四人以内保留原演出，扩展人数使用两列紧凑布局。
+ * @param {number} n 零至十六的整数人数，与席位编号无关。
  * @returns {Array<{ x: number, y: number, side: 'l'|'r'|'c', from?: [number, number], to?: [number, number] }>}
  */
 export function bootLayout(n) {
-  if (n <= 1) return [{ x: 703, y: 645, side: 'c' }];
+  if (!Number.isInteger(n) || n < 0 || n > MAX_SEATS) throw new RangeError('开场人数必须是零至十六的整数');
+  if (n === 0) return [];
+  if (n === 1) return [{ x: 703, y: 645, side: 'c' }];
   const NODES = [[939, 497], [1008, 513], [905, 548], [968, 575], [930, 610], [1000, 630]];
-  return Array.from({ length: Math.min(n, 6) }, (_, i) => {
+  return Array.from({ length: n }, (_, i) => {
     const right = i % 2 === 1;
     const row = Math.floor(i / 2);
-    const y = 414 + row * 166 - (n > 4 ? 83 : 0);
+    const dense = n > 4;
+    const y = dense ? 160 + row * 68 : 414 + row * 166;
     const x = right ? 1233 : 172;
-    return { x, y, side: right ? 'r' : 'l', from: [right ? x - 10 : x + 525, y + 63], to: NODES[i] };
+    return { x, y, side: right ? 'r' : 'l', from: [right ? x - 10 : x + 525, y + (dense ? 31 : 63)],
+      to: dense ? [right ? 1008 : 939, 440 + row * 24] : NODES[i] };
   });
 }
 
@@ -80,13 +82,13 @@ function Art({ k, class: cls, mask = false }) {
 }
 
 /**
- * 「协议启动！」. `leaving` fades it out.
+ * 展示全体实际参与者的开场卡片；离场标志仅控制淡出，不截断高位席位。
  * @param {{ players: any[], myId: any, leaving?: boolean }} props
  */
 export function ProtocolBoot({ players, myId, leaving = false }) {
-  const list = (Array.isArray(players) ? players : []).slice(0, 6);
+  const list = Array.isArray(players) ? players : [];
   const spots = bootLayout(list.length);
-  return html`<div class=${cx('pboot', list.length <= 1 && 'pboot--solo', leaving && 'is-leaving')} role="status" aria-live="polite" aria-label=${t('协议启动！')}
+  return html`<div class=${cx('pboot', list.length <= 1 && 'pboot--solo', list.length > 4 && 'pboot--dense', leaving && 'is-leaving')} role="status" aria-live="polite" aria-label=${t('协议启动！')}
       data-testid="protocol-boot">
     <div class="pboot__stage">
       <div class="pboot__scene" aria-hidden="true">
@@ -111,7 +113,7 @@ export function ProtocolBoot({ players, myId, leaving = false }) {
         return html`<div key=${p.playerId ?? i} class=${cx('pboot__card', `pboot__card--${s.side}`, p.playerId === myId && 'is-self')}
             style=${`--x:${s.x};--y:${s.y};--i:${i}`}>
           <span class="pboot__txt">
-            <b class="pboot__num num">${String(i + 1).padStart(2, '0')}</b>
+            <b class="pboot__num num">${String((p.seat ?? i) + 1).padStart(2, '0')}</b>
             <span class="pboot__done">COMPLETE</span>
             <i class="pboot__check"><${Icon} name="check" /></i>
           </span>

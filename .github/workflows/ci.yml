@@ -52,24 +52,7 @@ jobs:
         run: npm run test
 
       - name: Server smoke test (boot, /healthz, index.html, doctor)
-        shell: bash
-        run: |
-          node server/index.js > server.log 2>&1 &
-          pid=$!
-          ok=
-          for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:3000/healthz; then ok=1; break; fi
-            sleep 1
-          done
-          echo
-          [ -n "$ok" ] || { cat server.log; exit 1; }
-          # Save the page first: piping curl into `grep -q` let grep exit on the first match, curl then failed with a
-          # write error (23) and pipefail turned that into a flaky red step.
-          curl -fsS -o index.out http://127.0.0.1:3000/
-          grep -qi '<html' index.out
-          curl -fsS -o /dev/null http://127.0.0.1:3000/vendor/pixi.min.js
-          node tools/doctor.mjs || true
-          kill $pid || true
+        run: node tools/ci.mjs --only smoke
 
   # Separate from the test matrix so lint / types / import boundaries run once, not four times.
   # Lint warnings do not fail the job (npm run lint does not pass --max-warnings=0).
@@ -96,3 +79,31 @@ jobs:
 
       - name: Typecheck
         run: npm run typecheck
+
+  compose:
+    name: 容器配置与构建（不宣称真实素材冷启动）
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SP_DOMAIN: game.example.invalid
+      ACME_EMAIL: operator@example.invalid
+      SP_ENTRY_TOKEN_PATH: ./deploy/secrets/entry-token
+      SP_SESSION_SECRET_PATH: ./deploy/secrets/session-secret
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.14.1
+          cache: npm
+      - name: 安装锁定依赖
+        run: npm ci --no-audit --no-fund
+      - name: 创建仅供配置检查的独立强密钥
+        run: node tools/deploy/control.mjs secrets "$PWD/deploy/secrets"
+      - name: 检查正式与本机配置
+        run: |
+          docker compose config --quiet
+          docker compose -f compose.yaml -f compose.local.yaml config --quiet
+      - name: 构建固定镜像（不下载游戏素材）
+        run: docker compose build
+      - name: 校验反代配置（不申请公网证书）
+        run: docker compose run --rm --no-deps proxy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile

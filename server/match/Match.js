@@ -15,13 +15,13 @@
 //   opts.aiPicksLast boolean (optional)         the co-op room option 「AI 队友最后选择」 (room.setAiPicksLast, GitHub #338):
 //                                              the strategy and 机变 drafts put every human seat before every AI seat
 //                                              (MatchPhases.humansFirst); only `true` turns it on; ignored in solo
-//   opts.seats       Array<{ seat: 0..3, playerId: string, name: string, isBot: boolean, connected: boolean,
+//   opts.seats       Array<{ seat: 0..15, playerId: string, name: string, isBot: boolean, connected: boolean,
 //                            loadout?: { [baseChessId]: { skill: index, module: uniEquipId|'none'|null } } | null,
 //                            ops?: { [charId]: { potential: 1–6, cultivate: 0–3 } } | null,
 //                            notOwned?: string[] | null,
 //                            diy?: { [slotBaseId]: { charId, skillIndex, uniEquipId } } | null }>
-//                    sorted by seat, 1–4 entries, ≥ 1 human; solo ⇒ exactly 1 human and no bots.
-//                    Bot playerIds start with 'ai_'. Seat indexes may have gaps (e.g. seats 0 and 2).
+//                    sorted by seat, 1–16 occupied entries, ≥ 1 human; solo ⇒ exactly 1 human and no bots.
+//                    Bot playerIds start with 'ai_'. Seat indexes may have gaps (e.g. seats 0, 7 and 15).
 //                    `loadout` (DESIGN §16, optional): the human's operator loadout, already checked by the lobby
 //                    (shared/protocol.js checkLoadout); PlayerState re-checks it against opts.data and ignores it for bots.
 //                    `ops` (0.2.2, optional): the human's per-operator 潜能 / 练度 (checkLoadoutOps; missing = 潜能 6, 精英2
@@ -31,6 +31,11 @@
 //                    for the match; those chess fight as their stand-ins (PlayerState setNotOwned; bots own everything).
 //                    `diy` (0.2.0 自选编队, optional): the human's 自选 picks (shared/protocol.js checkDiyPicks) — fixed for
 //                    the match; the slotted operators join the human's own shop (PlayerState setDiy / initDiyStock).
+//   opts.runtimeContext { version: 1, capacity: 4|8|16, participantCount: integer, personalPools: boolean } (optional)
+//                    Fixed at construction: participants are the actual humans + explicit bots in opts.seats, never
+//                    capacity, empty seats or spectators. personalPools is participantCount > 4. Omitted by legacy
+//                    callers: derive the smallest legal capacity fitting every seat and the actual count (minimum 4).
+//                    Explicit malformed/inconsistent context is rejected; this is runtime metadata, not content rules.
 //   opts.kitted      string[] (optional)        the operators a 自选 slot may field in this room (the content set's
 //                                              list, lobby.kittedFor). Absent on a vanilla match, so setDiy keeps
 //                                              KITTED_CHARS and a normal match stays byte-identical. A modded room
@@ -204,12 +209,13 @@
 //   common.js        what the modules share (FLOW_TICKER_PRIORITY, DELAYS, BAND_TURN_SECONDS — re-exported here, OK,
 //                    fail, BOSS_CLOCK_MS)
 
-import { PHASE, modeIdFor } from '../../shared/constants.js';
+import { DEFAULT_SEATS, MAX_SEATS, ROOM_CAPACITIES, PHASE, modeIdFor } from '../../shared/constants.js';
 import { isContentHash } from '../../shared/plugins/identity.js';
 import { Battle } from '../sim/Battle.js';
 import { DataSource } from '../sim/simdata.js';
 import { createRng, deriveSeed } from '../sim/rng.js';
 import { GameData } from './gamedata.js';
+import { stockIndependentTactic } from './choices.js';
 import { RealScheduler } from './scheduler.js';
 import { SharedPool, SharedItemPool, drawDisabledBonds } from './pool.js';
 import { PlayerState } from './PlayerState.js';
@@ -255,6 +261,52 @@ export function parseVerify(v) {
 const envBotRehearsal = () => String(env('SP_BOT_REHEARSAL') || '').trim().toLowerCase() === 'host';
 const noopLog = { info() {}, warn() {}, error() {}, debug() {} };
 
+/**
+ * Snapshot the occupied roster and its runtime rules, separately from content identity / plugin rules.
+ * Context-free empty host probes retain their legacy options; the real Match still requires seats.
+ */
+export function matchRuntimeOptions(opts) {
+  if (opts.runtimeContext === undefined && (opts.seats === undefined || (Array.isArray(opts.seats) && opts.seats.length === 0))) return opts;
+  const seats = opts.seats;
+  if (!Array.isArray(seats) || seats.length === 0 || seats.length > MAX_SEATS) throw new TypeError('Match: invalid runtime roster');
+  const players = new Set();
+  const occupied = new Set();
+  let requiredCapacity = Math.max(DEFAULT_SEATS, seats.length);
+  for (const s of seats) {
+    if (!s || typeof s.playerId !== 'string' || !s.playerId || players.has(s.playerId)
+      || !Number.isInteger(s.seat) || s.seat < 0 || s.seat >= MAX_SEATS || occupied.has(s.seat)) {
+      throw new TypeError('Match: invalid runtime roster');
+    }
+    players.add(s.playerId);
+    occupied.add(s.seat);
+    requiredCapacity = Math.max(requiredCapacity, s.seat + 1);
+  }
+  let capacity = ROOM_CAPACITIES.find((n) => n >= requiredCapacity);
+  const participantCount = seats.length;
+  const personalPools = participantCount > DEFAULT_SEATS;
+  const context = opts.runtimeContext;
+  if (context !== undefined) {
+    const keys = ['version', 'capacity', 'participantCount', 'personalPools'];
+    if (!context || typeof context !== 'object' || Array.isArray(context)
+      || ![Object.prototype, null].includes(Object.getPrototypeOf(context))
+      || Reflect.ownKeys(context).length !== keys.length
+      || keys.some((key) => !Object.hasOwn(Object.getOwnPropertyDescriptor(context, key) || {}, 'value'))) {
+      throw new TypeError('Match: invalid runtime context');
+    }
+    if (context.version !== 1 || !ROOM_CAPACITIES.includes(context.capacity) || context.capacity < requiredCapacity
+      || context.participantCount !== participantCount || context.personalPools !== personalPools) {
+      throw new TypeError('Match: inconsistent runtime context');
+    }
+    capacity = context.capacity;
+  }
+  const out = { ...opts };
+  Object.defineProperties(out, {
+    seats: { enumerable: true, configurable: false, writable: false, value: Object.freeze(seats.map((s) => Object.freeze({ ...s }))) },
+    runtimeContext: { enumerable: true, configurable: false, writable: false, value: Object.freeze({ version: 1, capacity, participantCount, personalPools }) },
+  });
+  return out;
+}
+
 const dsCache = new WeakMap();
 function dataSourceFor(data) {
   if (!data || typeof data !== 'object' || !data.chess) return undefined;
@@ -263,14 +315,18 @@ function dataSourceFor(data) {
   return ds;
 }
 
+/** 对局权威状态与生命周期；冻结开局规则，并为玩家绑定对应的有限库存。 */
 export class Match {
-  /** @param {object} opts see MATCH INTERFACE above */
+  /** 按给定座位、内容与通信回调建立对局及库存，登记运行状态但不自动开局；参数契约见文件头。 */
   constructor(opts) {
     if (!opts || !Array.isArray(opts.seats) || opts.seats.length === 0) throw new TypeError('Match: seats required');
     if (typeof opts.send !== 'function' || typeof opts.broadcast !== 'function' || typeof opts.onEnd !== 'function') {
       throw new TypeError('Match: send/broadcast/onEnd callbacks required');
     }
+    opts = matchRuntimeOptions(opts);
     this.opts = opts;
+    /** Frozen original roster rules: reconnects, departures and spectators never change them. */
+    Object.defineProperty(this, 'runtimeContext', { value: opts.runtimeContext, enumerable: true });
     this.roomCode = opts.roomCode ?? '----';
     this.mode = opts.mode === 'solo' ? 'solo' : 'coop';
     this.difficulty = opts.difficulty;
@@ -309,6 +365,10 @@ export class Match {
     /** window sequence (diagnostics and messages) */
     this.offerSeq = 0;
     this.gd = new GameData(this.data, this.modeId);
+    // 扩展局不能在耗尽库存后跳过机变；自定义内容须在创建对局前提供保留原效果的无库存依赖战术。
+    if (this.runtimeContext.personalPools && !this.gd.choices.cards?.tactic?.some((c) => stockIndependentTactic(this.gd, c))) {
+      throw new TypeError('个人机变需要至少一项仅发资金或免费刷新的合法原战术');
+    }
     if (!this.difficulty) this.difficulty = this.gd.difficulty;
     this.isSolo = this.mode === 'solo' || this.gd.isSolo;
     /** 「AI 队友最后选择」 (opts.aiPicksLast, GitHub #338): humans draft before AI seats (MatchPhases.humansFirst) */
@@ -438,8 +498,15 @@ export class Match {
     this.disabledBonds = bans.drawn;
     this.staticInactiveBonds = bans.staticOff;
     this.bannedChess = bans.banned;
-    this.pool = new SharedPool(this.gd, { banned: bans.banned });
-    this.itemPool = new SharedItemPool(this.gd, () => this.order);
+    // 扩展规则冻结于开局人数；个人库存沿用合作模式基数，不随容量或淘汰人数变化。
+    this.pool = this.runtimeContext.personalPools ? null : new SharedPool(this.gd, { banned: bans.banned });
+    this.itemPool = this.runtimeContext.personalPools ? null : new SharedItemPool(this.gd, () => this.order);
+    for (const ps of this.order) {
+      /** 该玩家普通干员的有限库存；四人以内所有玩家引用同一实例。 */
+      ps.chessPool = this.pool ?? new SharedPool(this.gd, { banned: bans.banned });
+      /** 该玩家装备的占用及透支账本；个人模式只统计持有者自己的物品。 */
+      ps.itemPool = this.itemPool ?? new SharedItemPool(this.gd, () => [ps]);
+    }
     // 自选编队 (0.2.0): each human's slotted DIY pieces get their own stock — none for one whose bonds are all off this
     // match (player/diy.js initDiyStock); no randomness is drawn here
     const off = new Set([...bans.drawn, ...bans.staticOff]);
@@ -451,6 +518,7 @@ export class Match {
     /** Final Assault / Hidden Core: ms epoch when the overtime drain starts (m.public.overtimeAt) */
     this.overtimeAt = 0;
     this.uidSeq = 0;
+    this._spSeq = 0;
     this.ended = false;
     this.disposed = false;
     this.startedAt = this.sched.now();
