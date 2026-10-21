@@ -119,29 +119,30 @@ export function loadBoardPack(assets) {
     const url = (g, n) => { const u = assets.localUrl(g, n); return typeof u === 'string' && u ? encodeURI(u) : null; };
     const dUrl = url(...PACK_IMAGES.D);
     if (!dUrl) return null;
-    const images = {};
-    await Promise.all(Object.entries(PACK_IMAGES).map(async ([k, [g, n]]) => {
+    const images = {}, meshes = { gate: {} };
+    // 纹理、材质和基础网格相互独立；并发开始，避免大纹理下载完后才发起小文件请求。
+    const imageTask = Promise.all(Object.entries(PACK_IMAGES).map(async ([k, [g, n]]) => {
       const u = url(g, n);
       if (!u) return;
       const img = await assets.image(u, { retry: true }).catch(() => null);
       if (img && (img.width || img.naturalWidth) > 0) images[k] = img;
     }));
-    if (!images.D) return null;
     const dir = dUrl.replace(/\/[^/]*$/, '');
-    const [tiles, theme, fxMats, fxPrefab, trapMats] = await Promise.all([
+    const metadataTask = Promise.all([
       fetchJson(`${dir}/tiles.json`),
       (async () => { const u = url('map/autochess', 'materials'); return u ? fetchJson(u) : null; })(),
       (async () => { const u = url('map/fx', 'materials'); return u ? fetchJson(u) : null; })(),
       (async () => { const u = url('map/fx', 'prefab'); return u ? fetchJson(u) : null; })(),
       (async () => { const u = url('mesh/trap_110', 'materials'); return u ? fetchJson(u) : null; })(),
     ]);
-    const meshes = { gate: {} };
-    await Promise.all(Object.entries(PACK_MESHES).map(async ([k, [g, n]]) => {
+    const meshTask = Promise.all(Object.entries(PACK_MESHES).map(async ([k, [g, n]]) => {
       const u = url(g, n);
       const text = u ? await fetchText(u) : null;
       const m = text ? parseObj(text) : null;
       if (m) meshes[k] = m;
     }));
+    const [, [tiles, theme, fxMats, fxPrefab, trapMats]] = await Promise.all([imageTask, metadataTask, meshTask]);
+    if (!images.D) return null;
     const prefab = Array.isArray(fxPrefab) ? fxPrefab : [];
     await Promise.all(Object.entries(GATE_NODES).map(async ([slot, node]) => {
       const rec = prefab.find((p) => p && p.name === node && (node !== 'Start_back' || p.parent === '[opt]start_box'));

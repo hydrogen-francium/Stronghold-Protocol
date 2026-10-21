@@ -75,6 +75,7 @@ import { BUNDLE_MANIFESTS } from './assetBundle.js';
 import { csUrlPart } from '../../shared/plugins/identity.js';
 import { FILE_URL_DIGITS, PLUGIN_AUDIO_EXTS, PLUGIN_FILES_URL, VISUAL_DOC_FILE, VISUAL_SETS_URL, VS_URL_DIGITS } from '../../shared/plugins/visual.js';
 import { SIM_WORKER_CSP } from './csp.js';
+import { createImageVariants, wantsWebp } from './imageVariants.js';
 import { UI_FRAME_CSP } from '../../shared/plugins/ui.js';
 
 /** Browser stand-in of server/data.js, served at /data.js (see the header). Served byte for byte: its first line names the entry, server/index.js. */
@@ -150,6 +151,7 @@ export function createStaticHandler({ publicDir, dataDir, assetPublicDir = publi
   const shimBody = Buffer.from(DATA_SHIM_JS);
   const shimTag = `"shim-${shimBody.length.toString(16)}"`;
   const gzipCache = new CompressCache(); // brotli and gzip bodies (files.js)
+  const imageVariant = createImageVariants(path.join(ROOT, '.cache', 'http-images-v1'));
 
   return async function serveStatic(req, res, rawPath, query) {
     let decoded;
@@ -338,6 +340,19 @@ export function createStaticHandler({ publicDir, dataDir, assetPublicDir = publi
     }
     const indexed = mount.name === 'public' && segments.length > 1 && ASSET_INDEX_ROOTS.includes(segments[0]);
     const opts = indexed ? hashedFileOpts(assetIndex, segments.join('/'), stat, urlHash) : (urlHash ? { cacheControl: 'no-cache' } : {});
+    // 浏览器图片请求协商无损 WebP；普通下载仍返回原 PNG，素材包的哈希契约不变。
+    if (mount.name === 'public' && wantsWebp(req, segments, stat.size)) {
+      const converted = await imageVariant(absPath, stat, opts.contentHash);
+      // 小图不一定能压得更小，此时保留原格式；两种表示都按 Accept 分离缓存。
+      opts.headers = { ...opts.headers, Vary: 'Accept' };
+      if (converted.stat.size < stat.size) {
+        opts.contentHash = `${opts.contentHash || `${stat.size}-${stat.mtimeMs}`}-webp-v1`;
+        await serveFile(req, res, converted.path, converted.stat, mount.name, segments, query, gzipCache, log, opts);
+        return;
+      }
+    } else if (mount.name === 'public' && segments[0] === 'assets' && path.extname(absPath).toLowerCase() === '.png') {
+      opts.headers = { ...opts.headers, Vary: 'Accept' };
+    }
     await serveFile(req, res, absPath, stat, mount.name, segments, query, gzipCache, log, opts);
   };
 }

@@ -251,8 +251,10 @@ function MatchScreen() {
   const [resultBox, setResultBox] = useState(null);      // the round's result box (ResultDialog), shown at SETTLE
   const [bossPlate, setBossPlate] = useState(null);      // ui/bossPlates.js: { kind: 'final'|'core'|'end', … , key }
   const [readyBusy, setReadyBusy] = useState(false);
+  // 共享机变没有个人选择标识；渲染忙碌卡片时必须先确认请求存在，不能把两个未定义标识视为已有请求。
   const [spBusy, setSpBusy] = useState(null);
-  const [personalBusy, setPersonalBusy] = useState(null); // { choiceId, idx }: an older request cannot clear a newer pick
+  // 个人请求按选择标识隔离，避免旧请求完成后清除新牌面的忙碌状态。
+  const [personalBusy, setPersonalBusy] = useState(null);
   const [layer, setLayer] = useState('ALL');             // 联防 / 最终攻势 camera: 'L' | 'ALL' | 'R'
   const [pen, setPen] = useState(false);                 // the camera shows the enemy preview pen (research 09 §2)
   const [camKind, setCamKind] = useState('prep');        // kind of the last camera request (data-camera)
@@ -1775,7 +1777,7 @@ function MatchScreen() {
 
     ${hasOffers && !sp && !personalChoice ? html`<${OfferOverlay} pub=${pub} myId=${myId} readOnly=${spectator || !alive} onAction=${actions.offer} />` : null}
     ${sp ? html`<${ChoiceOverlay} key=${sp.id ?? 'shared'} pub=${pub} sp=${sp} myId=${myId} solo=${solo}
-      busyIdx=${spBusy?.choiceId === sp.id ? spBusy.idx : null} total=${total}
+      busyIdx=${spBusy !== null && spBusy.choiceId === sp.id ? spBusy.idx : null} total=${total}
       onPick=${async (i) => {
         const choiceId = sp.id;
         setSpBusy({ choiceId, idx: i });
@@ -1783,7 +1785,7 @@ function MatchScreen() {
         setSpBusy((b) => b?.choiceId === choiceId ? null : b);
       }} />` : null}
     ${personalChoice ? html`<${ChoiceOverlay} key=${personalChoice.id} pub=${pub} sp=${personalChoice} myId=${myId} solo=${solo} personal=${true}
-      busyIdx=${personalBusy?.choiceId === personalChoice.id ? personalBusy.idx : null} total=${total}
+      busyIdx=${personalBusy !== null && personalBusy.choiceId === personalChoice.id ? personalBusy.idx : null} total=${total}
       onPick=${async (i) => {
         const choiceId = personalChoice.id;
         setPersonalBusy({ choiceId, idx: i });

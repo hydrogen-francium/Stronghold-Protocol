@@ -47,14 +47,14 @@ let TitleScreen, sanitizeName, LobbyScreen, rememberRoom, parseRoomParam, joinKn
 let audio, installAudio, settingsStore, GuideHost, installDeviceSupport, registerImportedAssetWorker, LoadoutHost, StatsHost;
 let installRehearsal, recordResult, installStatsRecorder, installLoadoutSync, installOwnershipSync, installDiySync, installSkinsSync;
 let startBuildGuard, initLang, useLang, tickerText, recordError, installTrafficMeter, installContent, installContentSet, cosmetics, stopPluginFrames;
-let SCREENS;
+let SCREENS, preloadGameScreen, assetWarmup, stopAssetWarmup;
 
 /** loadout/skins/content and every module-time preference consumer are evaluated ONLY after setAccountScope. */
 async function loadGameGraph() {
   const modules = await Promise.all([
     import('../vendor/preact.module.js'), import('../vendor/hooks.module.js'), import('./ui/components.js'),
     import('./ui/connBanner.js'), import('./ui/toasts.js'), import('./data.js'), import('./ui/gameComponents.js'),
-    import('./screens/title.js'), import('./screens/lobby.js'), import('./screens/room.js'), import('./screens/game.js'),
+    import('./screens/title.js'), import('./screens/lobby.js'), import('./screens/room.js'), import('./screens/gameLoader.js'),
     import('./audio.js'), import('./ui/settings.js'), import('./ui/guide.js'), import('./ui/device.js'), import('./assetCache.js'),
     import('./screens/loadout.js'), import('./screens/stats.js'), import('./battle/rehearsal.js'), import('./ui/stats.js'),
     import('./ui/loadoutSync.js'), import('./ui/buildGuard.js'), import('./ui/lang.js'), import('./diag.js'),
@@ -67,7 +67,7 @@ async function loadGameGraph() {
   ]);
   [{ render }, { useErrorBoundary }, { html, UiHosts, Modal, Button, MicroLabel, closeAllDialogs },
     { ConnectionBanner }, { ToastHost, toast, toastError, describeError }, { data }, { GAME_FILES },
-    { TitleScreen, sanitizeName }, { LobbyScreen, rememberRoom, parseRoomParam, joinKnown }, { RoomScreen, TrustedNotice }, { GameScreen },
+    { TitleScreen, sanitizeName }, { LobbyScreen, rememberRoom, parseRoomParam, joinKnown }, { RoomScreen, TrustedNotice }, { GameScreen, preloadGameScreen },
     { audio, installAudio }, { settingsStore }, { GuideHost }, { installDeviceSupport }, { registerImportedAssetWorker },
     { LoadoutHost }, { StatsHost }, { installRehearsal }, { recordResult, installStatsRecorder },
     { installLoadoutSync, installOwnershipSync, installDiySync, installSkinsSync }, { startBuildGuard },
@@ -313,17 +313,18 @@ function wireNet() {
 }
 
 /**
- * Download every data file of the match UI (gameComponents GAME_FILES: operators, skills, bonds, items, enemies, 特质 …)
- * in the background once the player is in a room — a match is near (the lobby alone never downloads them). The game's
- * texts are static data loaded once per page — never fetched during a match — and the match screen waits for these
- * files, so with them warmed it opens at once and no text ever appears late (user playtest #3 item 9). Idempotent (the
- * data store shares each file's promise).
+ * 进入房间后立即预热对局模块、静态数据和当前需要的美术素材；不阻塞标题页。
+ * 数据与模块复用已有下载结果，插件内容仍由内容系统加载；注销账号时停止继续预热。
  */
 function warmGameData() {
-  // a room with gameplay plugins: content.js downloads its content set's files instead (DESIGN §32.6)
-  const go = () => { if (accountPageStopped || store.get().room?.content?.vanilla === false) return; data.loadAll(GAME_FILES).catch(() => {}); };
-  if (typeof globalThis.requestIdleCallback === 'function') globalThis.requestIdleCallback(go, { timeout: 2500 });
-  else setTimeout(go, 600);
+  if (accountPageStopped) return;
+  // 加入房间即开始下载，不再额外等待浏览器空闲；插件房间的数据仍由内容系统提供。
+  preloadGameScreen().catch((error) => console.warn('[assets] game module warmup failed', error));
+  if (store.get().room?.content?.vanilla !== false) data.loadAll(GAME_FILES).catch((error) => console.warn('[assets] game data warmup failed', error));
+  assetWarmup ??= import('./assetWarmup.js').then(({ installAssetWarmup }) => {
+    if (!accountPageStopped) stopAssetWarmup = installAssetWarmup();
+  });
+  assetWarmup.catch((error) => console.warn('[assets] warmup installation failed', error));
 }
 
 // ---- UI chrome (the connection banner lives in ui/connBanner.js) -----------------------------------
@@ -424,6 +425,7 @@ function installGlobalErrorHandlers() {
 function stopAccountPage() {
   if (accountPageStopped) return;
   accountPageStopped = true;
+  stopAssetWarmup?.();
   accounts.suspendAccount();
   // Terminal before logout: stop traffic and prevent this document's caches from being reused by another login.
   try { stopPluginFrames?.(); } catch (err) { console.warn('[accounts] plugin cleanup failed', err); }

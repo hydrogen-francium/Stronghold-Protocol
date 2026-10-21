@@ -766,6 +766,15 @@ The 2026-09-27 verification pass also checked:
 - **Browser:** headless Chrome loads and animates all 529 Spine models with the vendored PixiJS 7.4.2 and pixi-spine 4.0.6, with no console errors. Chrome's font sanitizer also accepts the three WOFF2 files.
 - **Official data:** 771 provenance checks against the official data (`activity_table`, `skill_table`, `models_data.json`) all match: avatars, portraits, E2 art, bond, band and item icons, and enemy skeleton files.
 
+## 部署后的美术加载优化（2026-10-22）
+
+- 进入房间即预取对局模块、必要数据、当前头像与立绘、棋盘资源；开局后按本人商店、手牌、棋盘及下一波敌人更新预热队列，不下载整包候选素材。图片预热最多四路，模型最多一路。
+- 当前界面图片立即请求、异步解码；调配页和选择器的长列表保留懒加载，避免挤占当前画面带宽。
+- 支持 WebP 的浏览器请求指定界面目录的大 PNG 时，服务端以 `sharp@0.35.5` 生成无损 WebP，仅在体积更小时采用。原始 PNG、素材索引、骨骼纹理及下载校验不变；普通下载和 Range 请求仍返回原格式。
+- 派生缓存位于应用 `.cache/http-images-v1`，Compose 的缓存卷会保留它。首次请求有编码成本，后续复用磁盘缓存；按 `Accept` 区分 HTTP 缓存，认证资源继续遵守既有私有缓存策略。
+- 本地 12 张头像和 12 张立绘合计从 2,233,489 字节减少到 1,497,840 字节（32.9%）；不代表所有素材或公网耗时同幅度下降。棋盘与场景预热复用既有渲染器缓存，不转换骨骼纹理。
+- 升级需重新构建 app 镜像以安装新增依赖；无需重新下载或初始化已就绪的素材，不删除账号和素材卷。实现入口为 `public/js/assetWarmup.js` 与 `server/http/imageVariants.js`，参数来源见 [sharp 官方 WebP 文档](https://sharp.pixelplumbing.com/api-output/#webp)。
+
 ## Licensing and credits
 
 The project's code is GPL-3.0-or-later (`LICENSE`); none of the items below is covered by it. Details: `NOTICE.md` (scope, non-commercial terms) and `THIRD-PARTY-NOTICES.md` (libraries, fonts, licence texts).

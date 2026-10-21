@@ -59,13 +59,13 @@ export function makeLookups(ready = true) {
 }
 
 /**
- * <img> that swaps to a fallback node when the URL is missing or fails.
- * @param {{ src?: string|null, class?: string, alt?: string, fallback?: any, style?: string }} props
+ * 对局图片立即请求并异步解码；只有调配目录等屏外长列表显式使用懒加载。
+ * @param {{ src?: string|null, class?: string, alt?: string, fallback?: any, style?: string, loading?: string }} props 图片地址、样式及目录加载策略。
  */
-export function Img({ src, class: cls, alt = '', fallback = null, style }) {
+export function Img({ src, class: cls, alt = '', fallback = null, style, loading = 'eager' }) {
   const [bad, setBad] = useState(null);
   if (!src || bad === src) return fallback;
-  return html`<img class=${cls} src=${src} alt=${alt} draggable=${false} loading="lazy" style=${style} onError=${() => setBad(src)} />`;
+  return html`<img class=${cls} src=${src} alt=${alt} draggable=${false} loading=${loading} decoding="async" style=${style} onError=${() => setBad(src)} />`;
 }
 
 /** Official UI sprite by 'group/key' with a fallback. */

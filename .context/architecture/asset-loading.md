@@ -1,0 +1,37 @@
+# 房间与对局美术加载链路
+
+## Context（上下文）
+
+2026-10-22，用户反馈头像、立绘、棋盘等美术素材到第三回合仍未加载，要求优化并提交推送；部署由用户手动执行，不提交测试、素材或缓存。
+
+## Fact / Pitfall（事实与坑点）
+
+- 原先加入房间只延后预热静态数据，未统一预热图片、棋盘和当前单位模型。通用图片组件默认懒加载，对局模块却参与标题页的初始模块加载。
+- 图片地址与素材索引绑定内容哈希；直接覆盖原 PNG 会破坏原始下载和素材校验契约。应在 HTTP 表示层协商格式，不修改只读素材卷。
+- 预热不能枚举整包素材，否则大量候选会抢占当前商店、棋盘的带宽。战斗逐帧状态也不能触发全量收集。
+
+## Solution / Convention（实现规约）
+
+1. 账号身份确认后才加载账号相关模块，维持原有隔离。标题页使用 `screens/gameLoader.js`；进入房间立即预取真实对局模块和数据。
+2. `assetWarmup.js` 依据房间与本人快照选择头像、立绘、技能和道具图标、下一波敌人、当前单位模型；等待期仅补充前 24 个可见低阶干员，不获取其他玩家隐藏手牌。
+3. 图片最多四路，模型最多一路、每批最多 16 个且图片优先；模型沿用既有骨骼缓存，加载后释放引用。当前阶段和棋盘包进入房间后预热；不下载全部地图。离开房间不再启动队列，注销账号注销订阅。
+4. 通用图片与房间席位立绘立即请求并异步解码；调配页长列表等非当前视图继续显式懒加载。棋盘纹理、元数据和网格并行下载。
+5. `server/http/imageVariants.js` 仅为明确接受 WebP 的浏览器请求转换指定界面目录下大于等于 4 KiB 的 PNG；只返回更小的无损版本。排除 Range、骨骼纹理、插件素材；普通下载保持原字节。
+6. 派生文件写入应用 `.cache/http-images-v1`，Compose 已将 `.cache` 放入持久卷；并行转换最多两份，同图并发共享任务。首次命中需编码，后续读取缓存。错误沿用现有 HTTP 错误处理，不新增自动重试或吞错。
+7. 保留 `Vary: Accept`、独立表示 ETag、原始内容哈希地址与不可变缓存规则。登录静态响应还由既有认证包装追加 `Vary: Cookie` 和私有缓存规则。
+8. 新增固定生产依赖 `sharp@0.35.5`。更新部署必须重新构建 app 镜像；不重下素材、不清理账号卷、不修改宿主 Nginx。
+
+## Verification（验证记录与边界）
+
+- 24 张现有素材（12 张头像、12 张立绘）原 PNG 合计 2,233,489 字节，实际派生合计 1,497,840 字节，减少 32.9%；解码后尺寸、透明度和可见像素一致。此结果不是公网加载时长承诺。
+- 本地真实 Edge + 临时账号验证标题页未请求对局屏幕、房间提前请求头像立绘、一真人三 AI 开局无界面异常。服务器响应为 WebP；没有进行公网弱网、真实三人第四回合或完整 GPU 棋盘验收。
+- 定向覆盖格式协商、原文件与 Range 下载、条件缓存、旧哈希缓存语义、素材收集、棋盘加载和已知空忙碌状态：61 项中通过 59 项、跳过 2 项本机未提取的棋盘素材检查、失败 0 项。测试仅在本地保留。
+- 改动文件语法检查和 ESLint 无错误，保留 4 项既有警告。依赖锁检查确认原有依赖版本未改变；当前环境没有 Docker，未运行镜像构建或 Ubuntu 部署验证。
+- 现有导入检查仍报告 `server/sim/nodeData.js` 的三项 Node 内置模块导入边界问题，不扩大本次范围处理。
+
+## Reference（溯源）
+
+- `public/js/main.js`、`public/js/screens/gameLoader.js`、`public/js/assetWarmup.js`。
+- `public/js/ui/gameComponents.js`、`public/js/screens/room.js`、`public/js/screens/loadout.js`、`public/js/render/board3d/load.js`。
+- `server/http/static.js`、`server/http/imageVariants.js`、`server/http/auth.js`、`compose.yaml`。
+- sharp WebP 参数文档：https://sharp.pixelplumbing.com/api-output/#webp；安装版本的声明见 `node_modules/sharp/lib/output.js` 与 `node_modules/sharp/lib/index.d.ts`。
