@@ -467,8 +467,9 @@
 
 /* ---- team panel ------------------------------------------------------------------------------------------- */
 /* 队友与机变轮选标记共用此栏；限制高度并允许滚动，不能裁掉第七至十六名成员。 */
+/* 纵向滚动也会裁剪横向溢出，必须在容器内为行外的表情留出位置；右侧包含气泡、间距及弹出动画余量，上下保护首尾气泡。 */
 .team { position: absolute; left: .22rem; top: 2.36rem; max-height: calc(100% - 3.6rem); display: flex; flex-direction: column; gap: .14rem;
-  overflow-y: auto; overflow-x: hidden; padding: .1rem .12rem .1rem .04rem; pointer-events: auto; touch-action: pan-y; scrollbar-width: thin; overscroll-behavior-y: contain; }
+  overflow-y: auto; overflow-x: hidden; padding: .2rem 1.26rem .2rem .04rem; pointer-events: auto; touch-action: pan-y; scrollbar-width: thin; overscroll-behavior-y: contain; }
 .team__row { position: relative; flex: none; display: flex; align-items: center; gap: .1rem; pointer-events: auto; }
 .team__btn {
   position: relative; padding: 0; background: none; border: 0;

@@ -964,6 +964,8 @@ gets the table value of its own rounds. `onEnd(summary)` receives the same objec
 `m.emote { playerId, id }`: `id` must be one of `shared/constants.js EMOTES` (`BAD_MSG` otherwise, also when `handle()`
 is called without protocol validation); 1 per second per player (`RATE`).
 
+客户端气泡位于发送者的队友行右侧。队友栏保留纵向滚动，并在容器内部预留气泡与弹出动画空间，避免消息已经收到却被横向溢出裁剪；调整 `game.css` 的 `.team` 时必须同时检查 `emotes.css` 的气泡尺寸和首尾行。
+
 Tickers (`m.ticker { text, id, type, priority, playerId }`) from `config.broadcasts`: SHOP_LEVEL, GOLDEN_CHAR,
 CHAR_DAMAGE (per board unit per battle, highest threshold; summons created in battle once per unit type — a client
 result may only name the unit types its lineup can field, fields.js validateClientResult), BOSS_HIT (20/50/80 % of the

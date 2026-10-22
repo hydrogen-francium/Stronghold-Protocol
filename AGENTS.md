@@ -62,6 +62,7 @@ docs/SIM.md (the test harness section) and the patterns in `test/content/op_sieg
 
 ## 当前仓库索引
 
+- 遇到 `表情发不出去、收到 m.emote 但看不到、队友栏表情气泡消失或滚动裁剪行外气泡` 时，**必须**优先读取 `.context/pitfalls/emote-scroll-clipping.md`。
 - 遇到 `头像立绘加载慢、第三回合素材才出现、棋盘场景加载慢、棋盘预热、基础场景与细节分层、无损 WebP 或 http-images-v1 缓存` 时，**必须**优先读取 `.context/architecture/asset-loading.md`。
 - 遇到 `三人对局机变界面崩溃、Cannot read properties of null (reading idx)、spBusy 或 busyIdx 空值判断` 时，**必须**优先读取 `.context/pitfalls/shared-choice-null-busy.md`。
 - 遇到 `同盟模拟休整期没有倒计时、一名真人加三名 AI、loneHuman 或 soloUntimed` 时，**必须**优先读取 `.context/architecture/single-human-phase-timers.md`。
