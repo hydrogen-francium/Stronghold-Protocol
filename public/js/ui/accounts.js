@@ -59,7 +59,7 @@ async function authFetch(path, options, readBody = false) {
   } finally { clearTimeout(timer); }
 }
 
-/** Never reads cookie credentials or a locally fabricated profile. A status failure is not a guest account. */
+/** 从服务端验证账号并更新页面身份；注册凭证不参与登录身份判断，失败不得降级为游客。 */
 export async function refreshAccount() {
   if (suspended) return null;
   if (refreshPending) return refreshPending;
@@ -68,7 +68,7 @@ export async function refreshAccount() {
       headers: { Accept: 'application/json' } }, true);
     if (!response.ok) throw new Error(t('账号验证失败，请重新加载页面'));
     csrf = typeof body.csrf === 'string' && /^[0-9a-f]{64}$/.test(body.csrf) ? body.csrf : null;
-    const next = body.admitted === true ? normalizeAccount(body.account) : null;
+    const next = normalizeAccount(body.account);
     if (!csrf || (body.account && !next)) throw new Error(t('账号验证失败，请重新加载页面'));
     if (suspended) return null;
     // Module caches belong to one verified account for the whole document lifetime.

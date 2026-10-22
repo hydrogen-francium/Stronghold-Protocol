@@ -10,7 +10,7 @@ of the upstream 0.3.1 release. Capacity integration uses fork protocol version *
 
 | Layer | Credential / state | What it means |
 |---|---|---|
-| Entry grant | Signed `sp_gate` cookie, obtained with the deployment's entry token | Permission to enter this private server; not an account and not a participating seat |
+| Entry grant | Signed `sp_gate` cookie, obtained with the deployment's entry token | Permission to register an account; not required for subsequent login or game access |
 | Server account and HTTP session | Durable account `accountId`; opaque `sp_session` cookie and paired CSRF | Authenticated account identity, freshly checked against SQLite |
 | Game Session | In-memory `playerId`, reconnect `token`, room membership and socket owner | A retained game presence belonging to that authenticated account; not an HTTP login credential |
 
@@ -45,8 +45,9 @@ service manager. `server/auth/config.js` recognizes these settings:
 | `SP_BOT_LIMIT` | Separate server-wide AI-seat budget, default `16`; integer `0`–`256`. `0` prevents starting a roster containing AI seats. |
 
 The human participation limit is fixed at **16** by production configuration; there is no `SP_HUMAN_LIMIT` setting.
-Cookie lifetimes are constructor defaults (entry grant 12 hours; HTTP session 7 days), not configurable TTL environment
-variables in this implementation. Account existence does not expire with those cookies; expired access must be renewed.
+Cookie lifetimes are constructor defaults (registration grant 12 hours; HTTP session and its paired CSRF cookie 7 days),
+not configurable TTL environment variables. Successful registration/login clears the registration grant. Expired HTTP
+sessions require username/password login, not the shared entry token; account existence does not expire with cookies.
 
 Each secret must be well-formed UTF-8, 32–512 bytes, without leading/trailing whitespace or control characters. File
 settings must be absolute paths to bounded regular non-symlink files; one final LF/CRLF is removed. Do not set both
@@ -56,8 +57,8 @@ or `plugins/`. Do not include them in source archives, container build contexts,
 
 The configured Origin is not inferred from `Host`, `Origin`, forwarded headers or `TRUST_PROXY`. A reverse proxy may
 forward to loopback HTTP while browsers use the configured HTTPS Origin. Changing a tunnel domain or port requires
-matching configuration and a restart. Rotating either deployment secret invalidates old entry grants/game access;
-it does not delete durable accounts.
+matching configuration and a restart. Rotating the entry token invalidates registration grants only. Rotating the
+session secret invalidates registration grants and account sessions. Neither rotation deletes durable accounts.
 
 ## 3. Private SQLite and local maintenance
 
@@ -111,6 +112,11 @@ Auth APIs are `GET`/`HEAD /auth/status` and `POST /auth/admit`, `/auth/register`
 `/auth/logout`. Status provides the current safe projection and CSRF bootstrap; the entry token travels in JSON,
 never in a query string.
 
+The default shell shows username/password login without an entry-token prompt. Switching to registration requires
+`/auth/admit` followed by `/auth/register`; only registration requires a valid `sp_gate`. `/auth/login` accepts existing
+account credentials without that grant, while retaining exact-Origin, CSRF and rate-limit checks. `/auth/status` may
+return a valid `account` with `admitted: false`: `admitted` describes registration permission, not login identity.
+
 All auth writes require `Origin === SP_AUTH_ORIGIN`. The `X-CSRF-Token` header must match the `sp_csrf` cookie and the
 expected bootstrap/gate/session value; authenticated/gated values are compared through their stored/signed hash.
 Cookies are path `/`, `SameSite=Strict`; gate and session are `HttpOnly`; CSRF is browser-readable. HTTPS deployment
@@ -132,15 +138,16 @@ public exception, Cookie-policy change or CSP relaxation.
 
 ## 5. WebSocket authentication and recovery
 
-`/ws` upgrade requires the exact configured Origin plus valid entry and account-session cookies. Invalid identity
+`/ws` upgrade requires the exact configured Origin and a valid account-session cookie, not a registration grant. Invalid identity
 is refused before upgrade (401); an authorization-store failure fails closed (503). Trusted identity is attached
 out of band to `Network.handleConnection(ws, req, identity)`, copied into the connection, and never derived from a
 frame's account fields.
 
 Authorization is **fresh**, not a cached upgrade decision: adoption, every inbound frame, ping/pong liveness,
 heartbeat, actual execution of queued room/game work and asynchronous reply settlement check current validity.
-`AuthService.validateIdentity` checks entry expiry/version and freshly joins the HTTP session to an enabled account
-with matching credential version and unexpired session. Failures/exceptions use `AUTH_REQUIRED` and close code
+`AuthService.validateIdentity` freshly checks the HTTP session against an enabled account with matching account ID,
+credential version and unexpired session. The prepared boolean query does not materialize or parse the password record;
+it does not cache authorization, so revocation remains effective on the next validation. Failures/exceptions use `AUTH_REQUIRED` and close code
 **4003**. Normal transport closure does not destroy the retained game Session or release its active-seat lease.
 
 Handlers receive the original connection guard as `onMessage(session, msg, {isCurrent})` and

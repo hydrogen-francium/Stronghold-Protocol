@@ -96,6 +96,8 @@ const TICK = 1 / 30;
 export const CATCHUP_TICKS = 240;
 /** Silent catch-up slice (ticks) while a new battle is prepared before it is shown. */
 const PREPARE_SLICE = 600;
+/** 页面内模拟每批最多占用八毫秒；单个不可拆分的模拟刻可能超出预算。 */
+export const MAIN_THREAD_SLICE_MS = 8;
 const MAX_ENTRIES = 4;
 const STATE_EV = new Set(['spawn', 'die', 'deploy', 'status', 'skill', 'leak']);
 /**
@@ -389,17 +391,14 @@ export function createBattleRunner(deps) {
   /** Target tick of an entry on its clock. */
   const targetTick = (e, t) => Math.max(0, Math.floor((((t - e.t0) / 1000) * e.speed) / TICK + 1e-9));
 
-  /**
-   * Step `n` ticks. `sliced` (a catch-up frame, a hidden-tab step): every EV_SLICE ticks the events drained so far go to
-   * `e.slices` as { gt, ev } with that game time, for emitFrame / hold.
-   */
+  /** 推进最多 n 刻并记录耗时；页面模拟按时间分片，追赶事件带真实游戏时间，工作线程不占页面预算。 */
   function stepEntry(e, n, sliced = false) {
     const b = e.battle;
     const t = now();
     let k = 0;
     const accept = (out) => { k = out.ticks; e.slices.push(...out.slices); };
     try {
-      const out = e.host.step(n, { slice: sliced ? EV_SLICE : 0 });
+      const out = e.host.step(n, { slice: sliced ? EV_SLICE : 0, budgetMs: MAIN_THREAD_SLICE_MS });
       if (e.host.remote) return out.then((value) => {
         if (e.failed) return 0;
         accept(value);

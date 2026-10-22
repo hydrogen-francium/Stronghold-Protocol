@@ -6,8 +6,8 @@ const CSRF = /^[0-9a-f]{64}$/;
 const source = Object.freeze({
   title: '服务器账号登录', about: '自建服务器 · 非官方账号，与任何官方游戏账号无关。',
   language: '语言', zh: '简体中文', en: '英语', ja: '日语', ko: '韩语', tw: '繁体中文',
-  checking: '正在验证服务器准入…', admit: '服务器准入', entry: '共享准入令牌',
-  entryHint: '向本服管理员获取。令牌只提交给当前服务器，不会放入网址或本机存储。',
+  checking: '正在验证服务器准入…', admit: '注册准入', entry: '共享准入令牌',
+  entryHint: '仅注册时需要，向本服管理员获取。已有账号直接使用用户名和密码登录。令牌不会放入网址或本机存储。',
   admitButton: '验证准入令牌', login: '登录', register: '注册', username: '用户名',
   usernameHint: '3–32 位小写英文字母、数字或下划线；登录时不区分大小写。',
   name: '显示昵称', nameHint: '1–16 个字符；控制字符会被移除。昵称不是账号标识。',
@@ -102,7 +102,9 @@ function build() {
     nameField, password, confirm, confirmField, accountForm, accountSubmit, closed, message, retry };
   update();
 }
+/** 切换登录或注册模式，清空密码和令牌，避免在两种用途之间复用敏感输入。 */
 function changeMode(next) { clearSecrets(); mode = next === 'register' && registrationOpen ? 'register' : 'login'; setMessage(); }
+/** 根据账号模式和注册授权刷新表单；登录不展示也不依赖准入令牌。 */
 function update() {
   if (!dom) return;
   document.title = text('title'); document.documentElement.lang = lang === 'zh' ? 'zh-CN' : lang;
@@ -110,8 +112,9 @@ function update() {
   [...dom.language.options].forEach((option, i) => { option.textContent = t(LANGUAGE_NAMES[i]); });
   dom.language.value = lang;
   dom.checking.hidden = ready || (!busy && !loadingLanguage);
-  dom.admitForm.hidden = !ready || admitted;
-  dom.accounts.hidden = !ready || !admitted;
+  dom.admitForm.hidden = !ready || mode !== 'register' || admitted;
+  dom.accounts.hidden = !ready;
+  dom.accountForm.hidden = mode === 'register' && !admitted;
   dom.nameField.hidden = mode !== 'register'; dom.name.disabled = mode !== 'register';
   dom.confirmField.hidden = mode !== 'register'; dom.confirm.disabled = mode !== 'register';
   dom.password.autocomplete = mode === 'register' ? 'new-password' : 'current-password';
@@ -171,7 +174,7 @@ async function request(path, fields) {
     try { body = await response.json(); } catch { throw authError('invalidReply'); }
     if (!response.ok) {
       const code = typeof body?.error === 'string' ? body.error : '';
-      if (code === 'ENTRY_REQUIRED') { admitted = false; ready = false; }
+      if (code === 'ENTRY_REQUIRED') admitted = false;
       if (code === 'CSRF' || code === 'ORIGIN') { csrf = null; ready = false; }
       if (code === 'REGISTRATION_CLOSED') { registrationOpen = false; mode = 'login'; }
       throw authError(errorKeys[code] || 'unavailable', code);
@@ -184,12 +187,13 @@ async function request(path, fields) {
     throw authError('network');
   } finally { clearTimeout(timer); }
 }
+/** 拉取账号与注册授权状态并刷新防伪令牌；有效账号直接进入游戏。 */
 async function refreshStatus() {
   if (busy) return;
   busy = true; ready = false; messageKey = ''; clearSecrets(); update();
   try {
     const body = await request('/auth/status');
-    if (body.account && ACCOUNT_ID.test(body.account.id || '') && body.admitted === true) { location.replace('/'); return; }
+    if (body.account && ACCOUNT_ID.test(body.account.id || '')) { location.replace('/'); return; }
     if (body.account) throw authError('invalidReply');
     admitted = body.admitted === true; registrationOpen = body.registrationOpen === true; ready = true;
     if (!registrationOpen) mode = 'login';
@@ -220,9 +224,10 @@ async function submitAdmission(event) {
   // Admission rotates CSRF and may change registration availability; read the fresh server policy.
   if (admitted && !messageKey) await refreshStatus();
 }
+/** 提交当前账号表单；仅注册要求准入授权，成功后跳转并清除敏感输入。 */
 async function submitAccount(event) {
   event.preventDefault();
-  if (busy || !ready || !admitted) return;
+  if (busy || !ready || (mode === 'register' && !admitted)) return;
   const username = dom.username.value.trim().toLowerCase();
   const password = dom.password.value;
   const name = mode === 'register' ? validName(dom.name.value) : null;

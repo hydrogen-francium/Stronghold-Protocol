@@ -209,6 +209,7 @@ export class AuthStore {
     });
   }
 
+  /** 预编译账号和会话查询；实时连接只读取有效性，不加载密码记录且不缓存授权结果。 */
   #prepare() {
     const sql = {
       accountByUsername: `SELECT ${ACCOUNT_COLUMNS} FROM accounts WHERE username = ?`,
@@ -221,6 +222,9 @@ export class AuthStore {
         FROM sessions AS s JOIN accounts AS a ON a.accountId = s.accountId
         WHERE s.tokenHash = ? AND a.disabled = 0 AND s.credentialVersion = a.credentialVersion AND s.expiresAt > ?`,
       sessionExists: 'SELECT 1 AS present FROM sessions WHERE tokenHash = ?',
+      sessionValid: `SELECT 1 AS present FROM sessions AS s JOIN accounts AS a ON a.accountId = s.accountId
+        WHERE s.tokenHash = ? AND s.accountId = ? AND a.disabled = 0
+          AND s.credentialVersion = a.credentialVersion AND s.expiresAt > ?`,
       sessionCount: 'SELECT count(*) AS count FROM sessions',
       accountSessionCount: 'SELECT count(*) AS count FROM sessions WHERE accountId = ?',
       insertSession: 'INSERT INTO sessions (tokenHash, csrfHash, accountId, credentialVersion, createdAt, expiresAt) VALUES (?, ?, ?, ?, ?, ?)',
@@ -319,6 +323,13 @@ export class AuthStore {
       csrfHash: row.csrfHash, expiresAt: row.expiresAt,
       credentialVersion: row.sessionCredentialVersion, createdAt: row.sessionCreatedAt,
     };
+  }
+
+  /** 校验指定摘要是否仍属于有效账号会话；每次读取数据库，不解析与游戏帧无关的密码记录。 */
+  validateSession(tokenHash, accountId) {
+    this.#assertOpen();
+    if (typeof tokenHash !== 'string' || !DIGEST.test(tokenHash) || typeof accountId !== 'string' || !ACCOUNT_ID.test(accountId)) return false;
+    return !!this.#statements.sessionValid.get(tokenHash, accountId, this.#time());
   }
 
   revokeSession(tokenHash) {

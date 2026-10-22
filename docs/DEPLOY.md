@@ -33,7 +33,7 @@
 | 变量 | 要求 |
 |---|---|
 | `SP_AUTH_ORIGIN` | 必需，浏览器访问的精确 Origin，例如 `https://game.example.com`；无尾斜杠、路径、查询或片段。不是从 Host / 代理头自动推导。 |
-| `SP_ENTRY_TOKEN` 或 `SP_ENTRY_TOKEN_FILE` | 必需且二选一；准入共享口令，只给受邀玩家，在登录页提交，不放 URL。 |
+| `SP_ENTRY_TOKEN` 或 `SP_ENTRY_TOKEN_FILE` | 必需且二选一；注册共享口令，只给受邀玩家，在注册入口提交，不放 URL；已有账号登录不需要。 |
 | `SP_SESSION_SECRET` 或 `SP_SESSION_SECRET_FILE` | 必需且二选一；独立的服务端秘密，不得与准入口令相同，不给玩家。 |
 | `SP_STATE_DIR` | 绝对、私有、服务用户可写目录，默认 `<项目根>/var`；保存 `auth.sqlite` 及 WAL/SHM。 |
 | `SP_AUTH_ALLOW_HTTP` | 默认 `false`；仅接受 `1` / `true` / `0` / `false`。只给 `localhost` / `127.0.0.1` / `[::1]` 的 HTTP 本机开发放行，**不允许局域网、VPN 或公网 HTTP**。 |
@@ -43,7 +43,7 @@
 两份秘密各为 32–512 UTF-8 字节，无首尾空白、控制字符，必须不同。`_FILE` 需要私有绝对路径的普通非符号链接
 文件，允许去掉末尾一个 LF/CRLF。文件/状态目录不得落在任何静态服务根下（包括 `public`、`data`、`shared`、
 `server/sim`、`packs`、`plugins` 或自定义根），不能进入源码归档、镜像上下文、日志、诊断或公开挂载。
-轮换任一秘密会使旧准入授权/游戏访问失效，但不删除账号。
+轮换注册令牌只使旧注册授权失效，不影响已有账号登录；轮换会话秘密会使旧注册授权和账号会话失效。两者均不删除账号。
 
 先在操作系统/秘密管理工具中准备互不相同的随机秘密文件并限制权限，再把它们的**路径**交给进程。
 下面只说明变量名和启动关系；路径/域名是占位示例，文件不会由应用示例自动创建，也没有示例口令：
@@ -140,7 +140,7 @@ node server/auth/admin.js backup --db <existing-auth.sqlite> --output <new-backu
      git clone https://github.com/sganggs/Stronghold-Protocol.git C:\Stronghold-Protocol
      ```
 3. 先将本 fork 放到固定目录并配置 §0.1，再从**具有这些环境的同一终端**运行 `scripts\start-windows.bat`。它原有的准备流程是：安装依赖（`npm ci`；依赖已含时跳过）→ 复制前端库 → setup 准备素材/可选本机提取 → 启动。资源管理器双击不继承当前 PowerShell 的临时 `$env:`，不能用它替代服务配置；缺项时生产服务应拒绝启动。
-4. 玩家只打开与 `SP_AUTH_ORIGIN` 一致的 HTTPS 地址，先经 `/auth/` 准入并注册/登录，再进入游戏。启动脚本打印的 `http://192.168.*:3000` 是原有网络探测信息，不是本 fork 可用的账号入口。仅本机开发可用 §0.1 的 loopback HTTP 例外。关闭前台窗口即停止服务器，并结束内存中的对局。
+4. 玩家只打开与 `SP_AUTH_ORIGIN` 一致的 HTTPS 地址，在 `/auth/` 使用账号密码登录后进入游戏；仅注册新账号需要先验证共享令牌。启动脚本打印的 `http://192.168.*:3000` 是原有网络探测信息，不是本 fork 可用的账号入口。仅本机开发可用 §0.1 的 loopback HTTP 例外。关闭前台窗口即停止服务器，并结束内存中的对局。
 
 手动准备仍可用 `npm ci`、`node tools/setup.mjs`；启动是**带必需配置环境**的 `npm start`（即 `node server/index.js`）。这些包装脚本尚不能视为已完成认证部署向导。
 

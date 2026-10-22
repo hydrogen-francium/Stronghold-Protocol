@@ -8,6 +8,7 @@ export const WORKER_TIMEOUT_MS = 2000;
 export const WORKER_LOAD_TIMEOUT_MS = 15000;
 const failure = (code, message) => Object.assign(new Error(message), { code });
 
+/** 原版战斗的页面内模拟宿主；由调度器分配步数与时间预算，不改变确定性模拟规则。 */
 export class InPageSimHost {
   constructor({ loadSim = loadBrowserSim } = {}) { this.loadSim = loadSim; this.remote = false; this.battle = null; }
   async load(cs = null, content = null) {
@@ -20,16 +21,21 @@ export class InPageSimHost {
     this.meter = this.sim.spec.attachLpMeter(this.battle);
     return this;
   }
-  step(n, { slice = 0 } = {}) {
+  /** 推进最多 n 个模拟刻；预算耗尽后返回实际刻数和事件，后续调用继续，不丢弃模拟状态。 */
+  step(n, { slice = 0, budgetMs = Infinity } = {}) {
     const b = this.battle;
     const slices = [];
+    const deadline = Number.isFinite(budgetMs) ? performance.now() + budgetMs : Infinity;
     let ticks = 0;
-    for (; ticks < n && !b.finished; ticks++) {
+    // 在完整模拟刻之间让出线程，避免追赶几百刻时阻塞输入和 WebSocket 回包。
+    while (ticks < n && !b.finished) {
       b.step();
-      if (slice && (ticks + 1) % slice === 0 && ticks + 1 < n) {
+      ticks++;
+      if (slice && ticks % slice === 0 && ticks < n) {
         const ev = b.drainEvents() || [];
         if (ev.length) slices.push({ gt: Number(b.time) || 0, ev });
       }
+      if (deadline !== Infinity && performance.now() >= deadline) break;
     }
     // Lazy reads keep the vanilla runner's snapshot/event timing unchanged.
     return { get snap() { return b.snapshot(); }, get ev() { return b.drainEvents() || []; }, state: b, ticks, slices };

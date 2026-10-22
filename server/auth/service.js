@@ -1,4 +1,4 @@
-// Entry admission and durable accounts are separate from the game's reconnect token.
+// 注册授权、持久账号与游戏重连令牌分别管理，注册令牌不作为后续登录凭据。
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { publicAccount, normalizeUsername, sanitizeDisplayName } from './store.js';
 import { validatePassword } from './passwords.js';
@@ -129,7 +129,7 @@ export class AuthService {
     this.registrationOpen = registrationOpen;
     this.sessionTtlMs = sessionTtlMs;
     this.gateTtlMs = gateTtlMs;
-    // Rotation of either deployment secret invalidates all old entry grants and game access.
+    // 准入令牌只限制注册；更换会话密钥才会同时作废账号会话。
     this.key = createHmac('sha256', sessionSecret).update(HASH_DOMAIN).digest();
     this.entryDigest = digest(entryToken);
     this.gateVersion = createHmac('sha256', this.key).update(this.entryDigest).digest('hex');
@@ -171,23 +171,22 @@ export class AuthService {
     this.store.revokeSession(session.tokenHash);
     this.onRevoke(session.accountId, session.tokenHash);
   }
+  /** 从请求 Cookie 查询账号会话；返回当前身份或空值，不要求注册凭证仍有效。 */
   identity(req) {
     if (this.closed) return null;
-    const cookies = readCookies(req), gate = this.readGate(cookies);
+    const cookies = readCookies(req);
     const token = cookies[COOKIE_NAMES.session];
-    if (!gate || !TOKEN.test(token || '')) return null;
+    if (!TOKEN.test(token || '')) return null;
     const tokenHash = this.sessionHash(token);
     const session = this.store.sessionByHash(tokenHash);
     if (!session) return null;
     return { accountId: session.account.accountId, account: publicAccount(session.account), tokenHash,
-      csrfHash: session.csrfHash, expiresAt: session.expiresAt, gateExpiresAt: gate.exp, gateVersion: gate.v };
+      csrfHash: session.csrfHash, expiresAt: session.expiresAt };
   }
-  // Upgrade and every inbound game frame use the same check; logout/disable cannot leave an authorised socket alive.
+  /** 每次连接校验均读取当前数据库，返回身份是否有效；注销、封禁及改密立即生效。 */
   validateIdentity(identity) {
-    if (this.closed || !identity?.tokenHash || !identity.accountId || identity.gateVersion !== this.gateVersion ||
-        !Number.isSafeInteger(identity.gateExpiresAt) || identity.gateExpiresAt <= this.now()) return false;
-    const session = this.store.sessionByHash(identity.tokenHash);
-    return !!session && session.account.accountId === identity.accountId;
+    if (this.closed || !identity?.tokenHash || !identity.accountId) return false;
+    return this.store.validateSession(identity.tokenHash, identity.accountId);
   }
   checkOrigin(req) { return req.headers?.origin === this.origin; }
   csrfValid(req, cookies, expected) {
@@ -204,7 +203,7 @@ export class AuthService {
     let gate = this.readGate(cookies), identity = this.identity(req), csrf = cookies[COOKIE_NAMES.csrf];
     const expected = identity?.csrfHash || gate?.csrf;
     if (!TOKEN.test(csrf || '') || (expected && !constantEqual(digest(csrf), expected))) {
-      // Without the paired CSRF cookie, restart the entry flow rather than returning an unusable authenticated form.
+      // 缺少配对防伪 Cookie 时撤销旧会话并重建匿名状态，避免返回不可提交的登录表单。
       this.#revokeCookieSession(cookies, identity);
       csrf = secretToken();
       gate = null;
@@ -216,6 +215,7 @@ export class AuthService {
       registrationOpen: this.registrationOpen });
   }
 
+  /** 处理认证路径并返回是否已响应；注册验证准入授权，账号写操作保留来源及防伪校验。 */
   async handle(req, res, path) {
     if (path === '/auth' || path === '/auth/') {
       if (req.method !== 'GET' && req.method !== 'HEAD') { send(req, res, 405, { error: 'METHOD' }); return true; }
@@ -238,11 +238,13 @@ export class AuthService {
       res.setHeader('Retry-After', '60'); send(req, res, 429, { error: 'RATE' }); return true;
     }
     const cookies = readCookies(req), gate = this.readGate(cookies), identity = this.identity(req);
-    if (action !== 'admit') {
-      if (!gate) { send(req, res, 401, { error: 'ENTRY_REQUIRED' }); return true; }
-      if (!this.csrfValid(req, cookies, identity?.csrfHash || gate.csrf)) { send(req, res, 403, { error: 'CSRF' }); return true; }
+    // 只有注册消耗管理员准入授权；已有账号登录仍须通过同源和防伪校验。
+    if (action === 'register' && !gate) { send(req, res, 401, { error: 'ENTRY_REQUIRED' }); return true; }
+    const expectedCsrf = identity?.csrfHash || gate?.csrf;
+    if (action !== 'admit' && expectedCsrf) {
+      if (!this.csrfValid(req, cookies, expectedCsrf)) { send(req, res, 403, { error: 'CSRF' }); return true; }
     } else {
-      // Bootstrap POST uses an exact Origin plus the same-origin status cookie; the shared token never enters a URL.
+      // 未登录时用精确来源和同源状态页签发的防伪 Cookie；登录不再依赖注册令牌。
       const csrf = req.headers['x-csrf-token'];
       if (typeof csrf !== 'string' || !TOKEN.test(csrf) || cookies[COOKIE_NAMES.csrf] !== csrf) {
         send(req, res, 403, { error: 'CSRF' }); return true;
@@ -290,8 +292,8 @@ export class AuthService {
           expiresAt: this.now() + this.sessionTtlMs, expectedCredentialVersion: account.credentialVersion });
         if (identity) { this.store.revokeSession(identity.tokenHash); this.onRevoke(identity.accountId, identity.tokenHash); }
         this.setCookies(res, [this.cookie(COOKIE_NAMES.session, token, Math.floor(this.sessionTtlMs / SECOND)),
-          this.cookie(COOKIE_NAMES.gate, this.grantGate(csrf), Math.floor(this.gateTtlMs / SECOND)),
-          this.cookie(COOKIE_NAMES.csrf, csrf, Math.floor(this.gateTtlMs / SECOND), false)]);
+          this.cookie(COOKIE_NAMES.gate, '', 0),
+          this.cookie(COOKIE_NAMES.csrf, csrf, Math.floor(this.sessionTtlMs / SECOND), false)]);
         send(req, res, 200, { account: publicAccount(current), csrf });
       }
     } catch (error) {

@@ -44,7 +44,7 @@
 ### 3. 认证与持久化契约
 
 - `docs/AUTH.md` 是本 fork 的认证、Admission、账号本地隔离与验收状态契约，不是上游 0.3.1 的功能清单。
-- 三层身份分别为准入 `sp_gate`、持久账号及 HTTP 会话 `sp_session`、内存游戏 Session。昵称、IP、房间码或浏览器本地资料不能证明账号身份。
+- 三层身份分别为注册授权 `sp_gate`、持久账号及 HTTP 会话 `sp_session`、内存游戏 Session。2026-10-22 起共享令牌仅用于注册，已有账号登录和游戏连接不再依赖 `sp_gate`；详见 `registration-and-realtime-latency.md`。昵称、IP、房间码或浏览器本地资料不能证明账号身份。
 - `startServer()` 在监听前校验配置并创建账号服务和唯一的中央 Admission；缺少配置即拒绝启动。README 和 CONTRIBUTING 的上游启动示例不能替代 fork 配置。
 - 必须配置 `SP_AUTH_ORIGIN`，以及各自二选一的 `SP_ENTRY_TOKEN` / `SP_ENTRY_TOKEN_FILE` 和 `SP_SESSION_SECRET` / `SP_SESSION_SECRET_FILE`。应用不自动加载 `.env`。
 - 秘密和 SQLite 状态必须位于私有目录，不能进入静态服务根、打包产物、日志或诊断。详细约束以 `docs/AUTH.md` §2 和 `docs/DEPLOY.md` §0.1 为准。
