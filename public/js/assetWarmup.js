@@ -70,24 +70,31 @@ export function collectWarmAssets(state, source = data, art = assets) {
 /** 安装房间级预热：图片最多四路、骨骼最多一路；返回注销函数，退出账号后不再发起请求。 */
 export function installAssetWarmup() {
   let stopped = false, scheduled = false, active = 0, modelActive = false;
-  let images = [], models = [], renderer;
+  let images = [], models = [], renderer, boardModule;
   const started = new Set(), startedModels = new Set(), scenes = new Set();
 
-  /** 在房间提前启动渲染依赖和棋盘；沿用渲染器的缓存，不建立第二套下载实现。 */
+  /** 并行预热渲染依赖与棋盘，返回模型加载所需的就绪状态；场景不等待这些大文件。 */
   async function prepareRenderer() {
-    const [pixi, board, art] = await Promise.all([
-      import("./render/app/pixi.js"), import("./render/board3d/load.js"), import("./render/boardArt.js"),
-      import("./render/app.js"),
-    ]);
-    if (stopped || !store.get().room) return null;
     const preference = new URLSearchParams(location.search).get("render") || globalThis.__SP_RENDER__;
     if (preference === "fallback") return null;
-    await Promise.all([pixi.ensurePixi(), art.loadBoardArt(assets)]);
-    if (stopped || !store.get().room) return null;
-    if (new URLSearchParams(location.search).get("board") !== "2d" && board.webgl2Available() && await board.boardArtListed(assets)) {
-      await Promise.all([board.loadThree(), board.loadBoardPack(assets)]);
-    }
-    return board;
+    const boardPreference = new URLSearchParams(location.search).get("board");
+    // 能力检查只执行一次；明确指定三维模式时与实际渲染器使用相同的慢速设备规则。
+    boardModule = import("./render/board3d/load.js").then(async (board) => {
+      if (stopped || !store.get().room || boardPreference === "2d" || !board.webgl2Available(boardPreference === "3d")) return null;
+      return await board.boardArtListed(assets) ? board : null;
+    });
+    const [pixi] = await Promise.all([
+      import("./render/app/pixi.js").then((module) => module.ensurePixi()),
+      import("./render/boardArt.js").then((art) => stopped || !store.get().room ? null : art.loadBoardArt(assets)),
+      boardModule.then(async (module) => {
+        if (module) await Promise.all([module.loadThree(), module.loadBoardPack(assets)]);
+        return module;
+      }),
+      import("./render/app.js"),
+    ]);
+    if (stopped || !store.get().room || !pixi) return null;
+    // 二维模式也依赖骨骼运行库，不能因为没有三维棋盘就跳过当前单位模型预热。
+    return true;
   }
 
   /** 图片队列空闲后才预热当前单位，完成后释放引用，仍受已有骨骼缓存预算约束。 */
@@ -140,10 +147,10 @@ export function installAssetWarmup() {
       }
       // 场景只按服务器实际选定的地图预热，不下载全部关卡。
       const stage = state.match.public?.stageId;
-      if (renderer && stage && !scenes.has(stage)) {
+      if (boardModule && stage && !scenes.has(stage)) {
         scenes.add(stage);
-        renderer.then((board) => {
-          if (board && !stopped && store.get().room && new URLSearchParams(location.search).get("board") !== "2d" && board.webgl2Available()) return board.loadScenePack(assets, stage);
+        boardModule.then((board) => {
+          if (board && !stopped && store.get().room) return board.loadScenePack(assets, stage);
         }).catch((error) => console.warn("[assets] scene warmup failed", stage, error));
       }
       pumpImages();

@@ -11,6 +11,8 @@
 // (board3d/load.js, which reads the manifest only) and this art share one download — also when the manifest lists
 // the WebP copy tools/local-extract writes and the table still names the PNG.
 
+import { unhashedUrl } from '../../../shared/assetPaths.js';
+
 let cached = null;
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -39,10 +41,11 @@ export function loadBoardArt(assets) {
     if (!manifest) return null;
     const atlasUrl = assets.localUrl ? assets.localUrl(BOARD_GROUP, 'TX_autochessi_D') : null;
     if (!atlasUrl) return null;
-    const dir = atlasUrl.replace(/\/[^/]*$/, '');
-    let tiles = null;
+    // 裁剪表不是图集本身，不能继承图集专属的内容哈希。
+    const dir = unhashedUrl(atlasUrl).replace(/\/[^/]*$/, '');
+    let tiles;
     try {
-      const res = await fetch(`${dir}/tiles.json`, { cache: 'no-cache' });
+      const res = await fetch(`${dir}/tiles.json`);
       tiles = res.ok ? await res.json() : null;
     } catch { tiles = null; }
     if (!isObj(tiles) || !isObj(tiles.materials) || !isObj(tiles.source)) return null;

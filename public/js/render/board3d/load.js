@@ -15,6 +15,7 @@
 
 import { resolveUvTable } from './atlas.js';
 import { parseObj } from './obj.js';
+import { unhashedUrl } from '../../../../shared/assetPaths.js';
 
 export const THREE_URL = '/vendor/three.module.js';
 
@@ -99,11 +100,13 @@ export async function boardArtListed(assets) {
   return typeof u === 'string' && u.length > 0;
 }
 
+/** 读取可选网格文本，沿用服务器的新鲜度及内容哈希缓存策略，不强制重复校验。 */
 async function fetchText(url) {
-  try { const r = await fetch(url, { cache: 'no-cache' }); return r.ok ? await r.text() : null; } catch { return null; }
+  try { const r = await fetch(url); return r.ok ? await r.text() : null; } catch { return null; }
 }
+/** 读取可选材质或场景描述，保留既有缺失素材语义。 */
 async function fetchJson(url) {
-  try { const r = await fetch(url, { cache: 'no-cache' }); return r.ok ? await r.json() : null; } catch { return null; }
+  try { const r = await fetch(url); return r.ok ? await r.json() : null; } catch { return null; }
 }
 
 /**
@@ -127,7 +130,8 @@ export function loadBoardPack(assets) {
       const img = await assets.image(u, { retry: true }).catch(() => null);
       if (img && (img.width || img.naturalWidth) > 0) images[k] = img;
     }));
-    const dir = dUrl.replace(/\/[^/]*$/, '');
+    // 裁剪表与图集不是同一文件，派生地址必须先移除图集的内容哈希。
+    const dir = unhashedUrl(dUrl).replace(/\/[^/]*$/, '');
     const metadataTask = Promise.all([
       fetchJson(`${dir}/tiles.json`),
       (async () => { const u = url('map/autochess', 'materials'); return u ? fetchJson(u) : null; })(),
@@ -141,17 +145,20 @@ export function loadBoardPack(assets) {
       const m = text ? parseObj(text) : null;
       if (m) meshes[k] = m;
     }));
-    const [, [tiles, theme, fxMats, fxPrefab, trapMats]] = await Promise.all([imageTask, metadataTask, meshTask]);
+    // 出入口网格只依赖预制体描述，不应排在全部纹理和基础网格之后。
+    const gateTask = metadataTask.then(async ([, , , fxPrefab]) => {
+      const prefab = Array.isArray(fxPrefab) ? fxPrefab : [];
+      await Promise.all(Object.entries(GATE_NODES).map(async ([slot, node]) => {
+        const rec = prefab.find((p) => p && p.name === node && (node !== 'Start_back' || p.parent === '[opt]start_box'));
+        const key = rec && typeof rec.mesh === 'string' ? rec.mesh : node;
+        const u = url('map/fx', key);
+        const text = u ? await fetchText(u) : null;
+        const m = text ? parseObj(text) : null;
+        if (m) meshes.gate[slot] = { mesh: m, material: rec && Array.isArray(rec.materials) ? rec.materials[0] || null : null };
+      }));
+    });
+    const [, [tiles, theme, fxMats, , trapMats]] = await Promise.all([imageTask, metadataTask, meshTask, gateTask]);
     if (!images.D) return null;
-    const prefab = Array.isArray(fxPrefab) ? fxPrefab : [];
-    await Promise.all(Object.entries(GATE_NODES).map(async ([slot, node]) => {
-      const rec = prefab.find((p) => p && p.name === node && (node !== 'Start_back' || p.parent === '[opt]start_box'));
-      const key = rec && typeof rec.mesh === 'string' ? rec.mesh : node;
-      const u = url('map/fx', key);
-      const text = u ? await fetchText(u) : null;
-      const m = text ? parseObj(text) : null;
-      if (m) meshes.gate[slot] = { mesh: m, material: rec && Array.isArray(rec.materials) ? rec.materials[0] || null : null };
-    }));
     return {
       key: `${dUrl}#${tiles?.version || 0}`,
       images, meshes, tiles: isObj(tiles) ? tiles : null, uv: resolveUvTable(isObj(tiles) ? tiles : null),
@@ -301,11 +308,13 @@ export function sceneGroupRects(chunks) {
   return out;
 }
 
+/** 读取场景几何二进制，允许浏览器复用仍新鲜的不可变素材。 */
 async function fetchBuffer(url) {
-  try { const r = await fetch(url, { cache: 'no-cache' }); return r.ok ? await r.arrayBuffer() : null; } catch { return null; }
+  try { const r = await fetch(url); return r.ok ? await r.arrayBuffer() : null; } catch { return null; }
 }
 
 const sceneCache = new Map();
+const sceneBaseCache = new Map();
 
 /** Does the local-art manifest list the official scene of `stageId`? (manifest only) */
 export async function sceneListed(assets, stageId) {
@@ -314,44 +323,80 @@ export async function sceneListed(assets, stageId) {
   return !!assets.localUrl(sceneGroup(stageId), 'scene') && !!assets.localUrl(sceneGroup(stageId), 'bin');
 }
 
+/** 从清单获取场景图片；缺失图片沿用既有可选材质行为，不构造未登记地址。 */
+async function sceneImage(assets, group, name) {
+  const url = assets.localUrl(group, name);
+  if (!url) return null;
+  const image = await assets.image(encodeURI(url), { retry: true }).catch(() => null);
+  return image && (image.width || image.naturalWidth) > 0 ? image : null;
+}
+
+/** 返回材质实际引用且去重的纹理名称，区分颜色贴图与线性数据贴图。 */
+function sceneTextureNames(doc, ...keys) {
+  const materials = isObj(doc.materials) ? doc.materials : {};
+  return [...new Set(Object.values(materials).flatMap((m) => keys.map((k) => isObj(m) && typeof m[k] === 'string' ? m[k] : null)).filter(Boolean))];
+}
+
 /**
- * Load a stage's official scene (scene.json + scene.bin + lightmap pages + the materials' albedo and emission
- * (`images.tex`, sRGB) and normal / metallic-gloss (`images.data`, linear) textures + the reflection atlas
- * `images.env`). A missing texture, lightmap page or atlas only drops that map; a missing or malformed scene
- * gives null (→ the procedural board). scene.json `version` stays the mesh layout (SCENE_VERSION).
- * @returns {Promise<object|null>}
+ * 先返回正式场景的几何、颜色及光照贴图，避免法线和反射等细节阻塞地图出现。
+ * 描述到达即下载图片，与几何二进制并行；同关卡的预热和渲染共享一次任务。
+ * @returns {Promise<object|null>} 可绘制的场景，数据贴图和反射由完整加载任务补齐。
  */
-export function loadScenePack(assets, stageId) {
+export function loadSceneBase(assets, stageId) {
   if (typeof stageId !== 'string' || !stageId) return Promise.resolve(null);
-  if (sceneCache.has(stageId)) return sceneCache.get(stageId);
+  if (sceneBaseCache.has(stageId)) return sceneBaseCache.get(stageId);
   const pending = (async () => {
     if (!(await sceneListed(assets, stageId)) || typeof assets.image !== 'function') return null;
     const url = (g, n) => { const u = assets.localUrl(g, n); return typeof u === 'string' && u ? encodeURI(u) : null; };
     const group = sceneGroup(stageId);
-    const [doc, buf] = await Promise.all([fetchJson(url(group, 'scene')), fetchBuffer(url(group, 'bin'))]);
+    const documentTask = fetchJson(url(group, 'scene'));
+    // 小描述文件已足以确定纹理清单，不能再等待数兆字节的几何文件。
+    const imageTask = documentTask.then(async (doc) => {
+      if (!isObj(doc) || doc.version !== SCENE_VERSION) return null;
+      const names = sceneTextureNames(doc, 'map', 'emissionMap');
+      const pages = Math.max(0, Math.min(16, doc.lightmaps | 0));
+      const [textures, lm] = await Promise.all([
+        Promise.all(names.map((name) => sceneImage(assets, SCENE_TEX_GROUP, name))),
+        Promise.all(Array.from({ length: pages }, (_, i) => sceneImage(assets, group, `lm${i}`))),
+      ]);
+      const tex = {};
+      names.forEach((name, i) => { if (textures[i]) tex[name] = textures[i]; });
+      return { tex, data: {}, lm, env: null };
+    });
+    const [doc, buf, images] = await Promise.all([documentTask, fetchBuffer(url(group, 'bin')), imageTask]);
     if (!isObj(doc) || doc.version !== SCENE_VERSION || !buf) return null;
     const chunks = parseSceneChunks(doc, buf);
     if (!chunks || !chunks.length) return null;
-    const img = async (u) => {
-      if (!u) return null;
-      const i = await assets.image(u, { retry: true }).catch(() => null);
-      return i && (i.width || i.naturalWidth) > 0 ? i : null;
-    };
-    const mats = isObj(doc.materials) ? doc.materials : {};
-    const namesOf = (...keys) => [...new Set(Object.values(mats).flatMap((m) => keys.map((k) => (isObj(m) && typeof m[k] === 'string' ? m[k] : null))).filter(Boolean))];
-    const names = namesOf('map', 'emissionMap'), dataNames = namesOf('normalMap', 'glossMap');
-    const pages = Math.max(0, Math.min(16, doc.lightmaps | 0));
-    const [texList, dataList, lm, env] = await Promise.all([
-      Promise.all(names.map((n) => img(url(SCENE_TEX_GROUP, n)))),
-      Promise.all(dataNames.map((n) => img(url(SCENE_TEX_GROUP, n)))),
-      Promise.all(Array.from({ length: pages }, (_, i) => img(url(group, `lm${i}`)))),
-      isObj(doc.env) ? img(url(group, 'env')) : null,
-    ]);
-    const tex = {}, data = {};
-    names.forEach((n, i) => { if (texList[i]) tex[n] = texList[i]; });
-    dataNames.forEach((n, i) => { if (dataList[i]) data[n] = dataList[i]; });
-    return { key: `${url(group, 'scene')}#${doc.binBytes | 0}`, stage: stageId, doc, chunks, groups: sceneGroupRects(chunks), images: { tex, data, lm, env } };
+    return { key: `${url(group, 'scene')}#${doc.binBytes | 0}`, stage: stageId, doc, chunks, groups: sceneGroupRects(chunks), images };
   })().catch((err) => { console.warn('[board3d] scene load failed', err); return null; }).then((pack) => {
+    if (!pack && sceneBaseCache.get(stageId) === pending) sceneBaseCache.delete(stageId);
+    return pack;
+  });
+  sceneBaseCache.set(stageId, pending);
+  return pending;
+}
+
+/**
+ * 基础场景就绪后补齐原画质的法线、光泽与反射；不抢占首次地图出现所需的下载。
+ * @returns {Promise<object|null>} 完整场景，与基础场景共享几何和颜色图片，不重复传输。
+ */
+export function loadScenePack(assets, stageId) {
+  if (typeof stageId !== 'string' || !stageId) return Promise.resolve(null);
+  if (sceneCache.has(stageId)) return sceneCache.get(stageId);
+  const pending = loadSceneBase(assets, stageId).then(async (base) => {
+    if (!base) return null;
+    const names = sceneTextureNames(base.doc, 'normalMap', 'glossMap');
+    const [textures, env] = await Promise.all([
+      Promise.all(names.map((name) => sceneImage(assets, SCENE_TEX_GROUP, name))),
+      isObj(base.doc.env) ? sceneImage(assets, sceneGroup(stageId), 'env') : null,
+    ]);
+    const data = {};
+    names.forEach((name, i) => { if (textures[i]) data[name] = textures[i]; });
+    const pack = { ...base, images: { ...base.images, data, env } };
+    // 完整场景到达后统一缓存，后续重复设置关卡不会先退回基础材质再重建。
+    if (sceneCache.get(stageId) === pending) sceneBaseCache.set(stageId, Promise.resolve(pack));
+    return pack;
+  }).catch((err) => { console.warn('[board3d] scene details load failed', err); return null; }).then((pack) => {
     if (!pack && sceneCache.get(stageId) === pending) sceneCache.delete(stageId);
     return pack;
   });
@@ -360,4 +405,4 @@ export function loadScenePack(assets, stageId) {
 }
 
 /** Forget the cached pack and the three.js import attempt (tests / hot reload). */
-export function resetBoardPack() { cached = null; threePromise = null; threeFailures = 0; sceneCache.clear(); }
+export function resetBoardPack() { cached = null; threePromise = null; threeFailures = 0; sceneCache.clear(); sceneBaseCache.clear(); }

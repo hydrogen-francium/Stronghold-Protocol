@@ -154,7 +154,7 @@ import { TILE_H, TIER_COLORS, COLORS } from './style.js';
 import { loadBoardArt } from './boardArt.js';
 import { ImpostorAtlas } from './impostor.js';
 import { stepClipBounds } from './spine.js';
-import { loadThree, loadBoardPack, loadScenePack, webgl2Available, boardArtListed } from './board3d/load.js';
+import { loadThree, loadBoardPack, loadSceneBase, loadScenePack, webgl2Available, boardArtListed } from './board3d/load.js';
 import { BoardScene } from './board3d/scene.js';
 import { layoutPen, penSignature } from './pen.js';
 import { IDENTITY, bossPrepField, tilesToDisp, leaderStand } from './prepfield.js';
@@ -441,9 +441,8 @@ export async function createFieldView(host, options = {}) {
   setupCleanup.push(() => impostors.destroy());
   ctx.impostors = impostors;
   tiles.setView(bandFor('prep'), camRect(), fieldRows('prep'));
-  // the real board art of the local client (optional): wait briefly so the first frame already uses it; a late
-  // arrival swaps the atlas in place
-  const artPromise = loadBoardArt(assets).then((art) => {
+  // 棋盘图片到达后原位替换，不延迟返回已可交互的视图。
+  loadBoardArt(assets).then((art) => {
     if (art && !destroyed) { tiles.setArt(art); tiles.project(cam, true); }
     return art;
   }, () => null);
@@ -455,13 +454,16 @@ export async function createFieldView(host, options = {}) {
   // lost-context recovery: the THREE module + art pack of the last 3D board, the pending retry, failures so far
   const recover = { THREE: null, pack: null, timer: 0, tries: 0, since: 0, off: false, count: 0 };
   setupCleanup.push(() => { clearTimeout(recover.timer); disable3d(); });
-  /** The stage's official scene, once loaded (the procedural board shows meanwhile and when there is none). */
+  /** 先展示已含颜色和烘焙光照的正式地图，再补齐原质量细节；过期关卡不修改当前画面。 */
   function useOfficialScene(st) {
     const id = st && typeof st.id === 'string' ? st.id : '';
-    if (!id || !board3d) return;
-    loadScenePack(assets, id).then((scene) => {
+    if (!id || !want3d) return;
+    /** 同时供基础和完整场景使用，避免异步到达时复活已销毁的棋盘。 */
+    const apply = (scene) => {
       if (scene && !destroyed && board3d && stageRec && stageRec.id === id) board3d.setScenePack(id, scene);
-    }).catch(() => {});
+    };
+    loadSceneBase(assets, id).then(apply).catch(() => {});
+    loadScenePack(assets, id).then(apply).catch(() => {});
   }
   function enable3d(THREE, pack) {
     if (destroyed || board3d || !THREE || !pack) return false;
@@ -534,8 +536,8 @@ export async function createFieldView(host, options = {}) {
       if (!enable3d(recover.THREE, recover.pack)) scheduleRecover();
     }, delay);
   }
-  // Attach the board only after synchronous setup completes; enable3d also guards late arrivals.
-  const boardReady = Promise.all([threePromise, packPromise]).then(([THREE, pack]) => (THREE && pack ? enable3d(THREE, pack) : false), () => false);
+  // 同步初始化完成后挂接棋盘；下载期间现有视图继续工作，不再额外等待最多六秒。
+  Promise.all([threePromise, packPromise]).then(([THREE, pack]) => (THREE && pack ? enable3d(THREE, pack) : false), () => false);
   let boardRetry = null;
   function retryBoard() {
     if (!want3d || destroyed || board3d || recover.off || recover.timer || boardRetry) return;
@@ -741,7 +743,9 @@ export async function createFieldView(host, options = {}) {
     stageRec = st;
     tiles.setStage(st);
     tiles.setBattleRect(mode === 'battle' && battleMeta ? battleMeta.rect : null);
-    if (board3d) { board3d.setStage(st); board3d.setBattleRect(mode === 'battle' && battleMeta ? battleMeta.rect : null); useOfficialScene(st); }
+    if (board3d) { board3d.setStage(st); board3d.setBattleRect(mode === 'battle' && battleMeta ? battleMeta.rect : null); }
+    // 关卡已确定就开始传输，不能等通用棋盘和运行库全部下载完才请求场景。
+    useOfficialScene(st);
     tiles.project(cam, true);
     // a pen laid out before the stage arrived (setPrep / a scouting board first) used the default zones and the old
     // tile heights: lay it out again on this stage
@@ -2371,14 +2375,10 @@ export async function createFieldView(host, options = {}) {
       pick: { pieceAt, mapCharAt, battleUnitAt, penUnitAt, groundTile },
     },
   };
-  // All teardown dependencies now exist. Aborting during either asset wait immediately releases
-  // the renderer, ticker and listeners; late shared asset results see destroyed and do nothing.
+  // 返回视图前登记销毁入口；取消时立即释放资源，晚到的共享素材由销毁标记拦截。
   setupCleanup.length = 0;
   onAbort = () => view.destroy();
   signal?.addEventListener('abort', onAbort, { once: true });
-  signal?.throwIfAborted();
-  await withTimeout(artPromise, 2500, signal);
-  if (want3d) await withTimeout(boardReady, 6000, signal);
   signal?.throwIfAborted();
   return view;
   } catch (err) {
